@@ -6,11 +6,11 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Configuration ---
-START_DATE = "2023-11-01" 
+START_DATE = "2023-01-01" 
 END_DATE = "2024-01-31" 
 RAW_DIR = "./raw_json"
 PARQUET_DIR = "./processed_parquet"
-MAX_WORKERS = 35 
+MAX_WORKERS = 35 # Edit according to available internet bandwidth
 
 os.makedirs(RAW_DIR, exist_ok=True)
 os.makedirs(PARQUET_DIR, exist_ok=True)

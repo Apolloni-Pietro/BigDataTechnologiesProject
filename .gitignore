@@ -1,3 +1,4 @@
 .bigdataeda/
 raw_json/
 processed_parquet/
+Tests/
