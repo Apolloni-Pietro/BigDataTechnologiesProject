@@ -32,4 +32,11 @@ TBD
 
 ## Project Implementation
 
-TBD
+First draft:
+
+1. GH Archive dump
+2. GitHub API Crawler
+3. ML / Anomaly Detection
+4. Redpanda (?)
+5. Cloud (?)
+6. Dashboard
