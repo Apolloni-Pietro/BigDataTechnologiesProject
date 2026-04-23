@@ -3,3 +3,4 @@ raw_json/
 processed_parquet/
 Tests/
 .secrets/ # Ignore the .secrets directory which contains sensitive information
+.DS_Store # Ignore macOS specific file
