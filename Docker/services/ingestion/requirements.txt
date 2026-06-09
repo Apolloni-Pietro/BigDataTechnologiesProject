@@ -1,0 +1,4 @@
+confluent-kafka==2.4.0
+requests==2.32.3
+tenacity==8.3.0
+pyarrow==16.0.0

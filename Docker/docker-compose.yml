@@ -1,0 +1,212 @@
+services:
+  # ────────────────────────────────────────────────
+  # INFRASTRUCTURE
+  # ────────────────────────────────────────────────
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:latest
+    container_name: oss-redpanda
+    command:
+      - redpanda
+      - start
+      - --mode dev-container
+      # dev-container disables performance checks that would
+      # otherwise require tuning the host OS. Fine for local use.
+      - --overprovisioned
+      # overprovisioned tells Redpanda not to complain about
+      # sharing CPU with other Docker containers.
+      - --smp 1
+      # smp = number of CPU cores Redpanda uses.
+      # 1 is enough for development.
+      - --memory 512M
+      - --reserve-memory 0M
+      - --node-id 0
+      - --kafka-addr PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
+      # Two listeners:
+      #   PLAINTEXT://  → used by containers INSIDE Docker network
+      #   OUTSIDE://    → used by tools on your HOST machine
+      - --advertise-kafka-addr PLAINTEXT://redpanda:29092,OUTSIDE://localhost:9092
+      # This tells clients which address to actually connect to.
+      # Containers use the Docker DNS name "redpanda" on port 29092.
+      # Your host machine uses localhost:9092.
+      - --check=false
+    ports:
+      - "9092:9092" # Kafka protocol — accessible from your laptop
+      - "9644:9644" # Admin API + Redpanda Console web UI
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      # Docker will only mark this container healthy when this
+      # command succeeds. Other services wait for this before starting.
+      test: ["CMD-SHELL", "rpk cluster info --brokers localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 8s
+      retries: 10
+      start_period: 20s
+      # start_period gives Redpanda 20s to boot before health
+      # checks begin. Without this it fails on the first check
+      # and Docker marks it unhealthy before it has even started.
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: oss-timescaledb
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-oss}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${POSTGRES_DB:-oss_health}
+      # ${VAR:-default} syntax: use the .env value if set,
+      # otherwise fall back to the default on the right.
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescale-data:/var/lib/postgresql/data
+      # This named volume persists your database across container restarts.
+      - ./init/timescale:/docker-entrypoint-initdb.d
+      # Any .sql or .sh file in this directory is executed automatically
+      # the FIRST TIME the container starts with an empty data volume.
+      # This is how we create the schema without running manual commands.
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-oss} -d ${POSTGRES_DB:-oss_health}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  redis:
+    image: redis/redis-stack:latest
+    # redis-stack is NOT the same as plain redis. It bundles additional
+    # modules: RedisTimeSeries (which we use), RediSearch, RedisJSON.
+    # The plain redis image does NOT have TS.ADD, TS.RANGE etc.
+    container_name: oss-redis
+    ports:
+      - "6379:6379" # Redis protocol
+      - "8001:8001" # RedisInsight web UI
+    volumes:
+      - redis-data:/data
+    command: >
+      redis-stack-server
+      --save 60 1
+      --maxmemory ${REDIS_MAX_MEMORY:-2gb}
+      --maxmemory-policy allkeys-lru
+      --loglevel warning
+    # --save 60 1: persist to disk if at least 1 key changed in 60 seconds
+    # allkeys-lru: when memory is full, evict the least-recently-used key.
+    # This is safe here because old data lives in TimescaleDB anyway.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ────────────────────────────────────────────────
+  # WORKERS
+  # ────────────────────────────────────────────────
+
+  ingestion-worker:
+    build:
+      context: ./services/ingestion
+      # context is the directory Docker uses as the build root.
+      # The Dockerfile at ./services/ingestion/Dockerfile will be used.
+    container_name: oss-ingestion
+    environment:
+      REDPANDA_BROKERS: redpanda:29092
+      # Note: this is the INTERNAL address (port 29092, not 9092).
+      # Containers talk to each other via the Docker internal network
+      # using the service name as the hostname. "redpanda" resolves to
+      # the Redpanda container's internal IP automatically.
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      INGESTION_START_DATE: ${INGESTION_START_DATE:-2024-01-01}
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      # This container will not start until Redpanda passes its healthcheck.
+      # Without this, the Python Kafka producer would crash on startup
+      # because the broker is not yet ready to accept connections.
+    volumes:
+      - ./data/parquet:/app/data/parquet
+      # Bind mount: ./data/parquet on your HOST maps to /app/data/parquet
+      # INSIDE the container. Files written here persist on your machine.
+    restart: on-failure
+    # on-failure: restart if the process exits with a non-zero code
+    # (i.e. crashed), but do NOT restart if it exits cleanly with code 0.
+
+  consumer-worker:
+    build:
+      context: ./services/consumer
+    container_name: oss-consumer
+    environment:
+      REDPANDA_BROKERS: redpanda:29092
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-oss}:${POSTGRES_PASSWORD:-changeme}@timescaledb:5432/${POSTGRES_DB:-oss_health}
+      # Again: "timescaledb" is the Docker DNS hostname for that container.
+      REDIS_URL: redis://redis:6379
+      # "redis" is the Docker DNS hostname for the Redis container.
+      FLUSH_EVERY: "50"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    # unless-stopped: always restart on crash, EXCEPT if you explicitly
+    # ran `docker compose stop` or `docker compose down`.
+
+  # ────────────────────────────────────────────────
+  # SERVING
+  # ────────────────────────────────────────────────
+
+  api:
+    build:
+      context: ./services/api
+    container_name: oss-api
+    ports:
+      - "8080:8080"
+    environment:
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-oss}:${POSTGRES_PASSWORD:-changeme}@timescaledb:5432/${POSTGRES_DB:-oss_health}
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  dashboard:
+    build:
+      context: ./services/dashboard
+    container_name: oss-dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      API_URL: http://api:8080
+      # The dashboard calls FastAPI over Docker's internal network.
+      # It never touches Redis or TimescaleDB directly.
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+# ────────────────────────────────────────────────
+# NAMED VOLUMES
+# ────────────────────────────────────────────────
+
+volumes:
+  redpanda-data:
+  timescale-data:
+  redis-data:
+  # These are managed by Docker. Data persists across `docker compose down`
+  # but is deleted by `docker compose down -v`.
+  # Unlike bind mounts, you cannot browse them directly in Finder/Explorer.
+  # Use `docker volume inspect oss-health-monitor_timescale-data` to find
+  # where Docker stores them on disk.
