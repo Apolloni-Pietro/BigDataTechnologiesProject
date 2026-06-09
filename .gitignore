@@ -3,4 +3,6 @@ raw_json/
 processed_parquet/
 Tests/
 .secrets/ # Ignore the .secrets directory which contains sensitive information
-.DS_Store # Ignore macOS specific file
+.DS_Store # Ignore macOS system files
+Docker/env
+.python_env/ # Ignore the Python virtual environment directory
