@@ -20,7 +20,6 @@ def download_single_file(file_name):
     file_path = os.path.join(RAW_DIR, file_name)
     url = f"https://data.gharchive.org/{file_name}"
     
-    # [EDIT] Skip download if the file is already on disk
     if os.path.exists(file_path):
         return f"{file_name} already exists. Skipped."
         
@@ -41,31 +40,39 @@ def convert_month_to_parquet(month_key):
     print(f"  Converting JSON to Parquet for {month_key}...")
     
     output_parquet = os.path.join(PARQUET_DIR, f"gh_events_{month_key}.parquet")
-    
-    # [EDIT] Glob pattern targets only files for this specific month (e.g., 2024-01-*.json.gz)
     glob_pattern = os.path.join(RAW_DIR, f"{month_key}-*.json.gz")
     
     con = duckdb.connect()
     
+    # [EDIT] Updated schema extraction to pull all relevant fields, ignore fluff, 
+    # and handle the polymorphic payload correctly.
     query = f"""
     COPY (
         SELECT 
             id,
-            type as event_type,
-            actor.login as contributor,
-            repo.name as repository,
-            created_at::TIMESTAMP as event_timestamp
+            type AS event_type,
+            actor.id AS actor_id,
+            actor.login AS actor_login,
+            repo.id AS repo_id,
+            repo.name AS repo_name,
+            org.id AS org_id,
+            org.login AS org_login,
+            public AS is_public,
+            created_at::TIMESTAMP AS event_timestamp,
+            payload::JSON AS payload
         FROM read_json('{glob_pattern}',
             format='newline_delimited',
             columns={{
                 'id': 'VARCHAR',
                 'type': 'VARCHAR',
-                'actor': 'STRUCT(login VARCHAR)',
-                'repo': 'STRUCT(name VARCHAR)',
-                'created_at': 'VARCHAR'
+                'actor': 'STRUCT(id BIGINT, login VARCHAR)',
+                'repo': 'STRUCT(id BIGINT, name VARCHAR)',
+                'org': 'STRUCT(id BIGINT, login VARCHAR)',
+                'public': 'BOOLEAN',
+                'created_at': 'VARCHAR',
+                'payload': 'JSON'
             }}
         )
-        WHERE type IN ('PushEvent', 'PullRequestEvent', 'IssuesEvent', 'IssueCommentEvent')
     ) TO '{output_parquet}' (FORMAT PARQUET, COMPRESSION 'ZSTD');
     """
     
@@ -96,7 +103,6 @@ def main():
     start = datetime.strptime(START_DATE, "%Y-%m-%d")
     end = datetime.strptime(END_DATE, "%Y-%m-%d")
     
-    # 1. Group all required files by month (YYYY-MM)
     tasks_by_month = defaultdict(list)
     current = start
     while current <= end:
@@ -106,11 +112,9 @@ def main():
             tasks_by_month[month_key].append(f"{date_str}-{hour}.json.gz")
         current += timedelta(days=1)
         
-    # 2. Process each month one at a time
     for month_key, files_to_download in tasks_by_month.items():
         print(f"\n=== Processing Month: {month_key} ===")
         
-        # Check if we already finished this month completely
         final_parquet_path = os.path.join(PARQUET_DIR, f"gh_events_{month_key}.parquet")
         if os.path.exists(final_parquet_path):
             print(f"  {final_parquet_path} already exists. Skipping entire month!")
@@ -118,21 +122,18 @@ def main():
             
         print(f"  Downloading missing files for {month_key}...")
         
-        # Download files in parallel
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {executor.submit(download_single_file, fname): fname for fname in files_to_download}
             
             completed = 0
             for future in as_completed(futures):
                 completed += 1
-                result = future.result()
+                future.result()
                 if completed % 100 == 0 or completed == len(files_to_download):
                     print(f"    Progress: {completed}/{len(files_to_download)} files checked/downloaded.")
         
-        # Convert to Parquet
         success = convert_month_to_parquet(month_key)
         
-        # Cleanup only if conversion was successful
         if success:
             cleanup_raw_files(month_key)
             
