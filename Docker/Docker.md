@@ -30,42 +30,44 @@ A FastAPI layer sits in front of both databases and exposes a unified REST API. 
 ## Architecture
 
 ```
-┌───────────────────────────────────────────────────────────────────────┐
-│                        Docker Compose Network                         │
-│                                                                       │
-│  ── Infrastructure ──────────────────────────────────────────────── │
-│                                                                       │
-│  ┌─────────────────┐  ┌──────────────────┐  ┌───────────────────┐   │
-│  │    Redpanda      │  │   TimescaleDB    │  │   Redis Stack     │   │
-│  │  Kafka-compat    │  │  PostgreSQL +    │  │  TimeSeries +     │   │
-│  │  broker          │  │  time-series     │  │  pub/sub          │   │
-│  │  :9092  :9644    │  │  :5432           │  │  :6379  :8001     │   │
-│  └─────────────────┘  └──────────────────┘  └───────────────────┘   │
-│         ▲  │                  ▲                       ▲              │
-│         │  │                  │                       │              │
-│  ── Workers ────────────────────────────────────────────────────── │
-│         │  │                  │                       │              │
-│  ┌──────┴──┴───────────┐  ┌───┴───────────────────────┴──────────┐  │
-│  │   Ingestion Worker   │  │          Consumer Worker             │  │
-│  │  GH Archive + API    │  │  Redpanda → metrics → dual-write     │  │
-│  │  → Redpanda producer │  │  to Redis (hot) + TimescaleDB (cold) │  │
-│  └─────────────────────┘  └──────────────────────────────────────┘  │
-│                                        │                             │
-│  ── Serving ────────────────────────── │ ──────────────────────── │
-│                                        ▼                             │
-│  ┌─────────────────────────────────────────────────────────────────┐ │
-│  │                          FastAPI  :8080                          │ │
-│  │              REST API — routes queries to Redis or TimescaleDB   │ │
-│  └──────────────────────────────┬──────────────────────────────────┘ │
-│                                 │                                    │
-│  ┌──────────────────────────────▼──────────────────────────────────┐ │
-│  │                      Streamlit  :8501                            │ │
-│  │              Dashboard — health charts, trend analysis           │ │
-│  └─────────────────────────────────────────────────────────────────┘ │
-│                                                                       │
-│  Named volumes: redpanda-data  timescale-data  redis-data            │
-│  Bind mount:    ./data/parquet  (Parquet files persist on host)      │
-└───────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────┐
+│                         Docker Compose Network                         │
+│                                                                        │
+│  ── Infrastructure ──────────────────────────────────────────────────  │
+│                                                                        │
+│  ┌──────────────────┐   ┌──────────────────┐   ┌──────────────────┐    │
+│  │     Redpanda     │   │   TimescaleDB    │   │   Redis Stack    │    │
+│  │  Kafka-compat    │   │  PostgreSQL +    │   │  TimeSeries +    │    │
+│  │  broker          │   │  time-series     │   │  pub/sub         │    │
+│  │  :9092  :9644    │   │  :5432           │   │  :6379  :8001    │    │
+│  └──────────────────┘   └──────────────────┘   └──────────────────┘    │
+│         ▲      │                 ▲                       ▲             │
+│         │      │                 │                       │             │
+│  ── Workers ───┼─────────────────┼───────────────────────┼───────────  │
+│         │      │                 │                       │             │
+│  ┌──────┴──────▼───────┐   ┌─────┴───────────────────────┴────────┐    │
+│  │   Ingestion Worker  │   │           Consumer Worker            │    │
+│  │  GH Archive + API   │   │  Redpanda → metrics → dual-write     │    │
+│  │  → Redpanda producer│   │  to Redis (hot) + TimescaleDB (cold) │    │
+│  └─────────────────────┘   └──────────────────────┬───────────────┘    │
+│                                                   │                    │
+│  ── Serving ──────────────────────────────────────┼──────────────────  │
+│                                                   ▼                    │
+│  ┌────────────────────────────────────────────────────────────────┐    │
+│  │                         FastAPI  :8080                         │    │
+│  │       REST API — routes queries to Redis or TimescaleDB        │    │
+│  └────────────────────────────────┬───────────────────────────────┘    │
+│                                   │                                    │
+│                                   ▼                                    │
+│  ┌────────────────────────────────────────────────────────────────┐    │
+│  │                        Streamlit  :8501                        │    │
+│  │            Dashboard — health charts, trend analysis           │    │
+│  └────────────────────────────────────────────────────────────────┘    │
+│                                                                        │
+│  Named volumes: redpanda-data  timescale-data  redis-data              │
+│  Bind mount:    ./data/parquet  (Parquet files persist on host)        │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Storage tiers
@@ -405,8 +407,8 @@ Consumer Worker — compute health metrics
   └─── INSERT INTO repo_health_metrics ──▶ TimescaleDB (cold, 2 years)
                                                  │
                                     ┌────────────┴────────────┐
-                                    │ FastAPI — routes by      │
-                                    │ time window requested    │
+                                    │ FastAPI — routes by     │
+                                    │ time window requested   │
                                     └────────────┬────────────┘
                                                  │  HTTP JSON
                                                  ▼
