@@ -36,7 +36,7 @@ def download_single_file(file_name):
         return f"[!] Error downloading {file_name}: {e}"
 
 def convert_month_to_parquet(month_key):
-    """Converts a single month's JSON files into a Parquet file."""
+    """Converts a single month's JSON files into an optimized Hybrid Parquet schema."""
     print(f"  Converting JSON to Parquet for {month_key}...")
     
     output_parquet = os.path.join(PARQUET_DIR, f"gh_events_{month_key}.parquet")
@@ -44,32 +44,85 @@ def convert_month_to_parquet(month_key):
     
     con = duckdb.connect()
     
-    # [EDIT] Updated schema extraction to pull all relevant fields, ignore fluff, 
-    # and handle the polymorphic payload correctly.
     query = f"""
     COPY (
         SELECT 
+            -- 1. Global Metadata
             id,
             type AS event_type,
+            (created_at::TIMESTAMP) AS event_timestamp,
+            public AS is_public,
             actor.id AS actor_id,
             actor.login AS actor_login,
             repo.id AS repo_id,
             repo.name AS repo_name,
             org.id AS org_id,
             org.login AS org_login,
-            public AS is_public,
-            created_at::TIMESTAMP AS event_timestamp,
-            payload::JSON AS payload
+
+            -- 2. Ordered Push payload
+            CASE WHEN type = 'PushEvent' THEN {{
+                'push_id': (payload->>'push_id')::BIGINT,
+                'ref': payload->>'ref',
+                'size': (payload->>'size')::INT,
+                'distinct_size': (payload->>'distinct_size')::INT,
+                'commits': list_transform(
+                    from_json(payload->>'commits', 'STRUCT(sha VARCHAR, author STRUCT(name VARCHAR), message VARCHAR)[]'),
+                    x -> {{'sha': x.sha, 'author_name': x.author.name, 'message': x.message}}
+                )
+            }} ELSE NULL END AS payload_push,
+
+            -- 3. Ordered Pull Request payload
+            CASE WHEN type = 'PullRequestEvent' THEN {{
+                'action': payload->>'action',
+                'number': (payload->>'number')::INT,
+                'title': payload->'pull_request'->>'title',
+                'state': payload->'pull_request'->>'state',
+                'is_draft': (payload->'pull_request'->>'draft')::BOOLEAN,
+                'additions': (payload->'pull_request'->>'additions')::INT,
+                'deletions': (payload->'pull_request'->>'deletions')::INT,
+                'changed_files': (payload->'pull_request'->>'changed_files')::INT,
+                'head_sha': payload->'pull_request'->'head'->>'sha',
+                'base_sha': payload->'pull_request'->'base'->>'sha'
+            }} ELSE NULL END AS payload_pull_request,
+
+            -- 4. Ordered Issue Comment payload
+            CASE WHEN type = 'IssueCommentEvent' THEN {{
+                'action': payload->>'action',
+                'issue_number': (payload->'issue'->>'number')::INT,
+                'issue_title': payload->'issue'->>'title',
+                'comment_id': (payload->'comment'->>'id')::BIGINT,
+                'comment_body': payload->'comment'->>'body'
+            }} ELSE NULL END AS payload_issue_comment,
+
+            -- 5. Ordered Issues lifecycle payload
+            CASE WHEN type = 'IssuesEvent' THEN {{
+                'action': payload->>'action',
+                'number': (payload->'issue'->>'number')::INT,
+                'title': payload->'issue'->>'title',
+                'state': payload->'issue'->>'state',
+                'labels': list_transform(
+                    from_json(payload->'issue'->>'labels', 'STRUCT(name VARCHAR)[]'),
+                    x -> x.name
+                )
+            }} ELSE NULL END AS payload_issue,
+
+            -- 6. Shared Create/Delete payload
+            CASE WHEN type IN ('CreateEvent', 'DeleteEvent') THEN {{
+                'ref': payload->>'ref',
+                'ref_type': payload->>'ref_type',
+                'master_branch': payload->>'master_branch'
+            }} ELSE NULL END AS payload_lifecycle
+
         FROM read_json('{glob_pattern}',
             format='newline_delimited',
             columns={{
                 'id': 'VARCHAR',
                 'type': 'VARCHAR',
+                'created_at': 'VARCHAR',
+                'public': 'BOOLEAN',
                 'actor': 'STRUCT(id BIGINT, login VARCHAR)',
                 'repo': 'STRUCT(id BIGINT, name VARCHAR)',
                 'org': 'STRUCT(id BIGINT, login VARCHAR)',
-                'public': 'BOOLEAN',
-                'created_at': 'VARCHAR',
                 'payload': 'JSON'
             }}
         )
