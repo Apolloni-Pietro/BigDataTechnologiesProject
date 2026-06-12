@@ -6,8 +6,8 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Configuration ---
-START_DATE = "2023-01-01" 
-END_DATE = "2024-01-31" 
+START_DATE = "2026-01-01" 
+END_DATE = "2026-01-31" 
 RAW_DIR = "./raw_json"
 PARQUET_DIR = "./processed_parquet"
 MAX_WORKERS = 35 # Edit according to available internet bandwidth
@@ -36,10 +36,11 @@ def download_single_file(file_name):
         return f"[!] Error downloading {file_name}: {e}"
 
 def convert_month_to_parquet(month_key):
-    """Converts a single month's JSON files into an optimized Hybrid Parquet schema."""
+    """Converts a single month's JSON files into the Optimized Hybrid Parquet schema."""
     print(f"  Converting JSON to Parquet for {month_key}...")
     
-    output_parquet = os.path.join(PARQUET_DIR, f"gh_events_{month_key}.parquet")
+    # We use Hive partitioning to prevent massive >30GB single files.
+    # Output will be written to directories like: ./processed_parquet/event_date=2023-01-01/
     glob_pattern = os.path.join(RAW_DIR, f"{month_key}-*.json.gz")
     
     con = duckdb.connect()
@@ -48,9 +49,10 @@ def convert_month_to_parquet(month_key):
     COPY (
         SELECT 
             -- 1. Global Metadata
-            id,
+            id::VARCHAR AS event_id,
             type AS event_type,
-            (created_at::TIMESTAMP) AS event_timestamp,
+            (created_at::TIMESTAMP)::DATE AS event_date,
+            created_at::TIMESTAMP AS event_timestamp,
             public AS is_public,
             actor.id AS actor_id,
             actor.login AS actor_login,
@@ -59,59 +61,137 @@ def convert_month_to_parquet(month_key):
             org.id AS org_id,
             org.login AS org_login,
 
-            -- 2. Ordered Push payload
+            -- 2. PushEvent
             CASE WHEN type = 'PushEvent' THEN {{
                 'push_id': (payload->>'push_id')::BIGINT,
                 'ref': payload->>'ref',
+                'head': payload->>'head',
+                'before': payload->>'before',
                 'size': (payload->>'size')::INT,
                 'distinct_size': (payload->>'distinct_size')::INT,
                 'commits': list_transform(
-                    from_json(payload->>'commits', 'STRUCT(sha VARCHAR, author STRUCT(name VARCHAR), message VARCHAR)[]'),
-                    x -> {{'sha': x.sha, 'author_name': x.author.name, 'message': x.message}}
+                    from_json(payload->>'commits', 'STRUCT(sha VARCHAR, author STRUCT(name VARCHAR), message VARCHAR, "distinct" BOOLEAN)[]'),
+                    x -> {{'sha': x.sha, 'author_name': x.author.name, 'message': x.message, 'is_distinct': x."distinct"}}
                 )
             }} ELSE NULL END AS payload_push,
 
-            -- 3. Ordered Pull Request payload
+            -- 3. PullRequestEvent
             CASE WHEN type = 'PullRequestEvent' THEN {{
                 'action': payload->>'action',
                 'number': (payload->>'number')::INT,
+                'pr_id': (payload->'pull_request'->>'id')::BIGINT,
                 'title': payload->'pull_request'->>'title',
                 'state': payload->'pull_request'->>'state',
-                'is_draft': (payload->'pull_request'->>'draft')::BOOLEAN,
+                'draft': (payload->'pull_request'->>'draft')::BOOLEAN,
+                'merged': (payload->'pull_request'->>'merged')::BOOLEAN,
                 'additions': (payload->'pull_request'->>'additions')::INT,
                 'deletions': (payload->'pull_request'->>'deletions')::INT,
                 'changed_files': (payload->'pull_request'->>'changed_files')::INT,
-                'head_sha': payload->'pull_request'->'head'->>'sha',
-                'base_sha': payload->'pull_request'->'base'->>'sha'
+                'head_ref': payload->'pull_request'->'head'->>'ref',
+                'base_ref': payload->'pull_request'->'base'->>'ref',
+                'body': payload->'pull_request'->>'body'
             }} ELSE NULL END AS payload_pull_request,
 
-            -- 4. Ordered Issue Comment payload
-            CASE WHEN type = 'IssueCommentEvent' THEN {{
-                'action': payload->>'action',
-                'issue_number': (payload->'issue'->>'number')::INT,
-                'issue_title': payload->'issue'->>'title',
-                'comment_id': (payload->'comment'->>'id')::BIGINT,
-                'comment_body': payload->'comment'->>'body'
-            }} ELSE NULL END AS payload_issue_comment,
-
-            -- 5. Ordered Issues lifecycle payload
+            -- 4. IssuesEvent
             CASE WHEN type = 'IssuesEvent' THEN {{
                 'action': payload->>'action',
+                'issue_id': (payload->'issue'->>'id')::BIGINT,
                 'number': (payload->'issue'->>'number')::INT,
                 'title': payload->'issue'->>'title',
                 'state': payload->'issue'->>'state',
+                'state_reason': payload->'issue'->>'state_reason',
+                'comments': (payload->'issue'->>'comments')::INT,
+                'body': payload->'issue'->>'body',
                 'labels': list_transform(
                     from_json(payload->'issue'->>'labels', 'STRUCT(name VARCHAR)[]'),
                     x -> x.name
                 )
             }} ELSE NULL END AS payload_issue,
 
-            -- 6. Shared Create/Delete payload
+            -- 5. IssueCommentEvent
+            CASE WHEN type = 'IssueCommentEvent' THEN {{
+                'action': payload->>'action',
+                'issue_number': (payload->'issue'->>'number')::INT,
+                'issue_title': payload->'issue'->>'title',
+                'comment_id': (payload->'comment'->>'id')::BIGINT,
+                'author_association': payload->'comment'->>'author_association',
+                'body': payload->'comment'->>'body'
+            }} ELSE NULL END AS payload_issue_comment,
+
+            -- 6. PullRequestReviewEvent
+            CASE WHEN type = 'PullRequestReviewEvent' THEN {{
+                'action': payload->>'action',
+                'pull_request_number': (payload->'pull_request'->>'number')::INT,
+                'review_id': (payload->'review'->>'id')::BIGINT,
+                'state': payload->'review'->>'state',
+                'body': payload->'review'->>'body'
+            }} ELSE NULL END AS payload_pr_review,
+
+            -- 7. PullRequestReviewCommentEvent
+            CASE WHEN type = 'PullRequestReviewCommentEvent' THEN {{
+                'action': payload->>'action',
+                'pull_request_number': (payload->'pull_request'->>'number')::INT,
+                'review_id': (payload->'comment'->>'pull_request_review_id')::BIGINT,
+                'comment_id': (payload->'comment'->>'id')::BIGINT,
+                'path': payload->'comment'->>'path',
+                'line': (payload->'comment'->>'line')::INT,
+                'body': payload->'comment'->>'body'
+            }} ELSE NULL END AS payload_pr_review_comment,
+
+            -- 8. CommitCommentEvent
+            CASE WHEN type = 'CommitCommentEvent' THEN {{
+                'comment_id': (payload->'comment'->>'id')::BIGINT,
+                'commit_id': payload->'comment'->>'commit_id',
+                'author_association': payload->'comment'->>'author_association',
+                'path': payload->'comment'->>'path',
+                'line': (payload->'comment'->>'line')::INT,
+                'position': (payload->'comment'->>'position')::INT,
+                'body': payload->'comment'->>'body'
+            }} ELSE NULL END AS payload_commit_comment,
+
+            -- 9. CreateEvent & DeleteEvent
             CASE WHEN type IN ('CreateEvent', 'DeleteEvent') THEN {{
                 'ref': payload->>'ref',
                 'ref_type': payload->>'ref_type',
-                'master_branch': payload->>'master_branch'
-            }} ELSE NULL END AS payload_lifecycle
+                'pusher_type': payload->>'pusher_type',
+                'master_branch': payload->>'master_branch',
+                'description': payload->>'description'
+            }} ELSE NULL END AS payload_lifecycle,
+
+            -- 10. ForkEvent
+            CASE WHEN type = 'ForkEvent' THEN {{
+                'forkee_id': (payload->'forkee'->>'id')::BIGINT,
+                'name': payload->'forkee'->>'name',
+                'full_name': payload->'forkee'->>'full_name',
+                'is_private': (payload->'forkee'->>'private')::BOOLEAN,
+                'owner_login': payload->'forkee'->'owner'->>'login'
+            }} ELSE NULL END AS payload_fork,
+
+            -- 11. ReleaseEvent
+            CASE WHEN type = 'ReleaseEvent' THEN {{
+                'action': payload->>'action',
+                'release_id': (payload->'release'->>'id')::BIGINT,
+                'name': payload->'release'->>'name',
+                'tag_name': payload->'release'->>'tag_name',
+                'draft': (payload->'release'->>'draft')::BOOLEAN,
+                'prerelease': (payload->'release'->>'prerelease')::BOOLEAN
+            }} ELSE NULL END AS payload_release,
+
+            -- 12. MemberEvent
+            CASE WHEN type = 'MemberEvent' THEN {{
+                'action': payload->>'action',
+                'member_id': (payload->'member'->>'id')::BIGINT,
+                'member_login': payload->'member'->>'login',
+                'member_type': payload->'member'->>'type'
+            }} ELSE NULL END AS payload_member,
+
+            -- 13. GollumEvent (Wiki)
+            CASE WHEN type = 'GollumEvent' THEN {{
+                'pages': list_transform(
+                    from_json(payload->>'pages', 'STRUCT(action VARCHAR, page_name VARCHAR, sha VARCHAR, title VARCHAR)[]'),
+                    x -> {{'action': x.action, 'page_name': x.page_name, 'sha': x.sha, 'title': x.title}}
+                )
+            }} ELSE NULL END AS payload_gollum
 
         FROM read_json('{glob_pattern}',
             format='newline_delimited',
@@ -126,12 +206,17 @@ def convert_month_to_parquet(month_key):
                 'payload': 'JSON'
             }}
         )
-    ) TO '{output_parquet}' (FORMAT PARQUET, COMPRESSION 'ZSTD');
+    ) TO '{PARQUET_DIR}' (
+        FORMAT PARQUET, 
+        COMPRESSION 'ZSTD', 
+        PARTITION_BY (event_date), 
+        OVERWRITE_OR_IGNORE 1
+    );
     """
     
     try:
         con.execute(query)
-        print(f"  Successfully created {output_parquet}")
+        print(f"  Successfully converted {month_key} into partitioned Parquet files.")
         return True
     except Exception as e:
         print(f"  [!] Failed to convert {month_key}: {e}")
