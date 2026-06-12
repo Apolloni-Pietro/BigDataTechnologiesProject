@@ -1,9 +1,13 @@
-.bigdataeda/
-raw_json/
-processed_parquet/
-Tests/
-.secrets/ # Ignore the .secrets directory which contains sensitive information
-.DS_Store # Ignore macOS system files
-Docker/env
 .python_env/ # Ignore the Python virtual environment directory
+
+raw_json/ # Working directory for raw JSON files
+processed_parquet/ # Working directory for processed Parquet files
+
+.secrets/ # Ignore the .secrets directory which contains sensitive information
+
+.DS_Store # Ignore macOS Finder metadata files
+Docker/.DS_Store # Ignore macOS Finder metadata files
+
+Docker/env # Ignore the Docker environment file which containssensitive information
+
 __pycache__/ # Ignore Python cache files
