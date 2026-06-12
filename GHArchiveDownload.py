@@ -1,4 +1,5 @@
 import os
+import gzip
 import requests
 import duckdb
 from datetime import datetime, timedelta
@@ -11,38 +12,81 @@ END_DATE = "2026-01-31"
 RAW_DIR = "./raw_json"
 PARQUET_DIR = "./processed_parquet"
 MAX_WORKERS = 35 # Edit according to available internet bandwidth
+MAX_RETRIES = 3  # Download attempts per file before giving up
 
 os.makedirs(RAW_DIR, exist_ok=True)
 os.makedirs(PARQUET_DIR, exist_ok=True)
 
-def download_single_file(file_name):
-    """Worker function to download exactly one file if it doesn't exist."""
-    file_path = os.path.join(RAW_DIR, file_name)
-    url = f"https://data.gharchive.org/{file_name}"
-    
-    if os.path.exists(file_path):
-        return f"{file_name} already exists. Skipped."
-        
+def is_valid_gzip(file_path):
+    """Return True only if the file decompresses fully without error.
+
+    A truncated download (the usual cause of 'unexpected end of data' during
+    conversion) raises EOFError / BadGzipFile here, letting us catch the
+    corruption before DuckDB ever touches the file.
+    """
     try:
-        response = requests.get(url, stream=True, timeout=30)
-        if response.status_code == 200:
-            with open(file_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            return f"Downloaded {file_name}"
-        else:
-            return f"[!] Failed to download {file_name} (Status: {response.status_code})"
-    except Exception as e:
-        return f"[!] Error downloading {file_name}: {e}"
+        with gzip.open(file_path, 'rb') as f:
+            while f.read(1024 * 1024):
+                pass
+        return True
+    except (OSError, EOFError):
+        return False
+
+def download_single_file(file_name):
+    """Download one file atomically, verifying gzip integrity before keeping it.
+
+    Guarantees that a file present in RAW_DIR is always a complete, valid
+    archive, so the month-wide conversion never trips over a partial download.
+    """
+    file_path = os.path.join(RAW_DIR, file_name)
+    tmp_path = file_path + ".part"
+    url = f"https://data.gharchive.org/{file_name}"
+
+    # Trust an existing file only if it is actually intact; otherwise re-fetch.
+    if os.path.exists(file_path):
+        if is_valid_gzip(file_path):
+            return f"{file_name} already exists. Skipped."
+        os.remove(file_path)
+        # fall through and re-download the corrupted file
+
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = requests.get(url, stream=True, timeout=60)
+            if response.status_code == 200:
+                # Write to a temp file first so a partial write never lands as .json.gz
+                with open(tmp_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                if is_valid_gzip(tmp_path):
+                    os.replace(tmp_path, file_path)  # atomic rename
+                    return f"Downloaded {file_name}"
+                last_error = "incomplete/corrupted archive"
+            elif response.status_code == 404:
+                # Some hours are genuinely absent on GH Archive; don't retry.
+                return f"[!] {file_name} not available (404)."
+            else:
+                last_error = f"HTTP {response.status_code}"
+        except Exception as e:
+            last_error = str(e)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+    return f"[!] Failed to download {file_name} after {MAX_RETRIES} attempts ({last_error})."
 
 def convert_month_to_parquet(month_key):
     """Converts a single month's JSON files into the Optimized Hybrid Parquet schema."""
     print(f"  Converting JSON to Parquet for {month_key}...")
-    
-    # We use Hive partitioning to prevent massive >30GB single files.
-    # Output will be written to directories like: ./processed_parquet/event_date=2023-01-01/
+
+    # All hours of the month are collapsed into a single Parquet file:
+    #   ./processed_parquet/gh_events_2026-01.parquet
     glob_pattern = os.path.join(RAW_DIR, f"{month_key}-*.json.gz")
-    
+    output_path = os.path.join(PARQUET_DIR, f"gh_events_{month_key}.parquet")
+
     con = duckdb.connect()
     
     query = f"""
@@ -70,8 +114,8 @@ def convert_month_to_parquet(month_key):
                 'size': (payload->>'size')::INT,
                 'distinct_size': (payload->>'distinct_size')::INT,
                 'commits': list_transform(
-                    from_json(payload->>'commits', 'STRUCT(sha VARCHAR, author STRUCT(name VARCHAR), message VARCHAR, "distinct" BOOLEAN)[]'),
-                    x -> {{'sha': x.sha, 'author_name': x.author.name, 'message': x.message, 'is_distinct': x."distinct"}}
+                    CAST(payload->'commits' AS JSON[]),
+                    x -> {{'sha': json_extract_string(x, '$.sha'), 'author_name': json_extract_string(x, '$.author.name'), 'is_distinct': (json_extract_string(x, '$.distinct'))::BOOLEAN}}
                 )
             }} ELSE NULL END AS payload_push,
 
@@ -80,16 +124,22 @@ def convert_month_to_parquet(month_key):
                 'action': payload->>'action',
                 'number': (payload->>'number')::INT,
                 'pr_id': (payload->'pull_request'->>'id')::BIGINT,
-                'title': payload->'pull_request'->>'title',
                 'state': payload->'pull_request'->>'state',
                 'draft': (payload->'pull_request'->>'draft')::BOOLEAN,
                 'merged': (payload->'pull_request'->>'merged')::BOOLEAN,
+                'author_association': payload->'pull_request'->>'author_association',
+                'created_at': (payload->'pull_request'->>'created_at')::TIMESTAMP,
+                'closed_at': (payload->'pull_request'->>'closed_at')::TIMESTAMP,
+                'merged_at': (payload->'pull_request'->>'merged_at')::TIMESTAMP,
+                'merged_by_login': payload->'pull_request'->'merged_by'->>'login',
+                'commits': (payload->'pull_request'->>'commits')::INT,
                 'additions': (payload->'pull_request'->>'additions')::INT,
                 'deletions': (payload->'pull_request'->>'deletions')::INT,
                 'changed_files': (payload->'pull_request'->>'changed_files')::INT,
+                'comments': (payload->'pull_request'->>'comments')::INT,
+                'review_comments': (payload->'pull_request'->>'review_comments')::INT,
                 'head_ref': payload->'pull_request'->'head'->>'ref',
-                'base_ref': payload->'pull_request'->'base'->>'ref',
-                'body': payload->'pull_request'->>'body'
+                'base_ref': payload->'pull_request'->'base'->>'ref'
             }} ELSE NULL END AS payload_pull_request,
 
             -- 4. IssuesEvent
@@ -97,14 +147,16 @@ def convert_month_to_parquet(month_key):
                 'action': payload->>'action',
                 'issue_id': (payload->'issue'->>'id')::BIGINT,
                 'number': (payload->'issue'->>'number')::INT,
-                'title': payload->'issue'->>'title',
                 'state': payload->'issue'->>'state',
                 'state_reason': payload->'issue'->>'state_reason',
+                'author_association': payload->'issue'->>'author_association',
+                'created_at': (payload->'issue'->>'created_at')::TIMESTAMP,
+                'closed_at': (payload->'issue'->>'closed_at')::TIMESTAMP,
                 'comments': (payload->'issue'->>'comments')::INT,
-                'body': payload->'issue'->>'body',
+                'reactions_total': (payload->'issue'->'reactions'->>'total_count')::INT,
                 'labels': list_transform(
-                    from_json(payload->'issue'->>'labels', 'STRUCT(name VARCHAR)[]'),
-                    x -> x.name
+                    CAST(payload->'issue'->'labels' AS JSON[]),
+                    x -> json_extract_string(x, '$.name')
                 )
             }} ELSE NULL END AS payload_issue,
 
@@ -112,10 +164,9 @@ def convert_month_to_parquet(month_key):
             CASE WHEN type = 'IssueCommentEvent' THEN {{
                 'action': payload->>'action',
                 'issue_number': (payload->'issue'->>'number')::INT,
-                'issue_title': payload->'issue'->>'title',
                 'comment_id': (payload->'comment'->>'id')::BIGINT,
                 'author_association': payload->'comment'->>'author_association',
-                'body': payload->'comment'->>'body'
+                'reactions_total': (payload->'comment'->'reactions'->>'total_count')::INT
             }} ELSE NULL END AS payload_issue_comment,
 
             -- 6. PullRequestReviewEvent
@@ -124,7 +175,7 @@ def convert_month_to_parquet(month_key):
                 'pull_request_number': (payload->'pull_request'->>'number')::INT,
                 'review_id': (payload->'review'->>'id')::BIGINT,
                 'state': payload->'review'->>'state',
-                'body': payload->'review'->>'body'
+                'author_association': payload->'review'->>'author_association'
             }} ELSE NULL END AS payload_pr_review,
 
             -- 7. PullRequestReviewCommentEvent
@@ -133,9 +184,10 @@ def convert_month_to_parquet(month_key):
                 'pull_request_number': (payload->'pull_request'->>'number')::INT,
                 'review_id': (payload->'comment'->>'pull_request_review_id')::BIGINT,
                 'comment_id': (payload->'comment'->>'id')::BIGINT,
+                'author_association': payload->'comment'->>'author_association',
                 'path': payload->'comment'->>'path',
                 'line': (payload->'comment'->>'line')::INT,
-                'body': payload->'comment'->>'body'
+                'reactions_total': (payload->'comment'->'reactions'->>'total_count')::INT
             }} ELSE NULL END AS payload_pr_review_comment,
 
             -- 8. CommitCommentEvent
@@ -145,33 +197,28 @@ def convert_month_to_parquet(month_key):
                 'author_association': payload->'comment'->>'author_association',
                 'path': payload->'comment'->>'path',
                 'line': (payload->'comment'->>'line')::INT,
-                'position': (payload->'comment'->>'position')::INT,
-                'body': payload->'comment'->>'body'
+                'reactions_total': (payload->'comment'->'reactions'->>'total_count')::INT
             }} ELSE NULL END AS payload_commit_comment,
 
             -- 9. CreateEvent & DeleteEvent
             CASE WHEN type IN ('CreateEvent', 'DeleteEvent') THEN {{
                 'ref': payload->>'ref',
                 'ref_type': payload->>'ref_type',
-                'pusher_type': payload->>'pusher_type',
-                'master_branch': payload->>'master_branch',
-                'description': payload->>'description'
+                'pusher_type': payload->>'pusher_type'
             }} ELSE NULL END AS payload_lifecycle,
 
             -- 10. ForkEvent
             CASE WHEN type = 'ForkEvent' THEN {{
                 'forkee_id': (payload->'forkee'->>'id')::BIGINT,
-                'name': payload->'forkee'->>'name',
                 'full_name': payload->'forkee'->>'full_name',
-                'is_private': (payload->'forkee'->>'private')::BOOLEAN,
-                'owner_login': payload->'forkee'->'owner'->>'login'
+                'owner_login': payload->'forkee'->'owner'->>'login',
+                'is_private': (payload->'forkee'->>'private')::BOOLEAN
             }} ELSE NULL END AS payload_fork,
 
             -- 11. ReleaseEvent
             CASE WHEN type = 'ReleaseEvent' THEN {{
                 'action': payload->>'action',
                 'release_id': (payload->'release'->>'id')::BIGINT,
-                'name': payload->'release'->>'name',
                 'tag_name': payload->'release'->>'tag_name',
                 'draft': (payload->'release'->>'draft')::BOOLEAN,
                 'prerelease': (payload->'release'->>'prerelease')::BOOLEAN
@@ -188,8 +235,8 @@ def convert_month_to_parquet(month_key):
             -- 13. GollumEvent (Wiki)
             CASE WHEN type = 'GollumEvent' THEN {{
                 'pages': list_transform(
-                    from_json(payload->>'pages', 'STRUCT(action VARCHAR, page_name VARCHAR, sha VARCHAR, title VARCHAR)[]'),
-                    x -> {{'action': x.action, 'page_name': x.page_name, 'sha': x.sha, 'title': x.title}}
+                    CAST(payload->'pages' AS JSON[]),
+                    x -> {{'action': json_extract_string(x, '$.action'), 'page_name': json_extract_string(x, '$.page_name'), 'sha': json_extract_string(x, '$.sha')}}
                 )
             }} ELSE NULL END AS payload_gollum
 
@@ -206,17 +253,15 @@ def convert_month_to_parquet(month_key):
                 'payload': 'JSON'
             }}
         )
-    ) TO '{PARQUET_DIR}' (
-        FORMAT PARQUET, 
-        COMPRESSION 'ZSTD', 
-        PARTITION_BY (event_date), 
-        OVERWRITE_OR_IGNORE 1
+    ) TO '{output_path}' (
+        FORMAT PARQUET,
+        COMPRESSION 'ZSTD'
     );
     """
-    
+
     try:
         con.execute(query)
-        print(f"  Successfully converted {month_key} into partitioned Parquet files.")
+        print(f"  Successfully converted {month_key} into {output_path}.")
         return True
     except Exception as e:
         print(f"  [!] Failed to convert {month_key}: {e}")
