@@ -23,7 +23,7 @@ pip install duckdb requests
 Run the code:
 
 ```
-python3 eda.py
+python3 GHArchiveDownload.py
 ```
 
 The script will create two directories:
