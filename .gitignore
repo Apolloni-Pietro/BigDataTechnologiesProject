@@ -1,13 +1,20 @@
-.python_env/ # Ignore the Python virtual environment directory
+# Ignore the Python virtual environment directory
+.python_env/
 
-raw_json/ # Working directory for raw JSON files
-processed_parquet/ # Working directory for processed Parquet files
+# Working directory for raw JSON files
+raw_json/
 
-.secrets/ # Ignore the .secrets directory which contains sensitive information
+# Working directory for processed Parquet files
+processed_parquet/
 
-.DS_Store # Ignore macOS Finder metadata files
-Docker/.DS_Store # Ignore macOS Finder metadata files
+# Ignore the .secrets directory which contains sensitive information
+.secrets/
 
-Docker/env # Ignore the Docker environment file which containssensitive information
+# Ignore macOS Finder metadata files
+.DS_Store
 
-__pycache__/ # Ignore Python cache files
+# Ignore the Docker environment file which contains sensitive information
+Docker/env
+
+# Ignore Python cache files
+__pycache__/
