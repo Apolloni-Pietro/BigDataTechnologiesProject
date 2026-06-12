@@ -11,3 +11,7 @@ We wrote a Python downloader to get data from GH Archive in `.json.gz` format an
 Challenges:
 
 - The first implementation downloaded files sequentially: this took a very long amount of time. Thus, the code was edited to handle downloads in parallel. This drastically reduced the time needed to run the script.
+
+## Phase 3.1 - Dockerization
+
+We then proceeded to create the Docker ecosystem in order to effectively deploy the project

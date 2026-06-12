@@ -3,9 +3,34 @@ services:
   # INFRASTRUCTURE
   # ────────────────────────────────────────────────
 
+  # MinIO is the BRONZE + SILVER backend: an S3-compatible object store.
+  # Raw GH Archive files and cleaned Parquet live here. See MEDALLION.md §3.
+  minio:
+    image: minio/minio:latest
+    container_name: oss-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # MinIO web console
+    volumes:
+      - minio-data:/data
+    # No Docker healthcheck here: the minio/minio server image is minimal and
+    # does not reliably ship `mc`/`curl`. The pipeline service has its own
+    # wait_for_minio() retry loop instead, so it depends on `service_started`.
+
+  # ── OPTIONAL streaming path (Phase 3) — off by default ──
+  # Redpanda + the ingestion/consumer workers form the real-time path (live
+  # GitHub Events API). They are gated behind the "streaming" profile because
+  # the hourly GH Archive ingest is intrinsically BATCH and must NOT be routed
+  # through a message bus. See MEDALLION.md §2 (Fix 2).
+  # Enable with:  docker compose --profile streaming up
   redpanda:
     image: docker.redpanda.com/redpandadata/redpanda:latest
     container_name: oss-redpanda
+    profiles: ["streaming"]
     command:
       - redpanda
       - start
@@ -112,6 +137,7 @@ services:
       # context is the directory Docker uses as the build root.
       # The Dockerfile at ./services/ingestion/Dockerfile will be used.
     container_name: oss-ingestion
+    profiles: ["streaming"]
     environment:
       REDPANDA_BROKERS: redpanda:29092
       # Note: this is the INTERNAL address (port 29092, not 9092).
@@ -138,6 +164,7 @@ services:
     build:
       context: ./services/consumer
     container_name: oss-consumer
+    profiles: ["streaming"]
     environment:
       REDPANDA_BROKERS: redpanda:29092
       POSTGRES_DSN: postgresql://${POSTGRES_USER:-oss}:${POSTGRES_PASSWORD:-changeme}@timescaledb:5432/${POSTGRES_DB:-oss_health}
@@ -155,6 +182,33 @@ services:
     restart: unless-stopped
     # unless-stopped: always restart on crash, EXCEPT if you explicitly
     # ran `docker compose stop` or `docker compose down`.
+
+  # The medallion pipeline: the DEFAULT ingestion path. Hourly bronze->silver->
+  # gold over GH Archive, daily dependency-risk enrichment, ML risk scoring.
+  pipeline:
+    build:
+      context: ./services/pipeline
+    container_name: oss-pipeline
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_SECURE: "false"
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-oss}:${POSTGRES_PASSWORD:-changeme}@timescaledb:5432/${POSTGRES_DB:-oss_health}
+      REDIS_URL: redis://redis:6379
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      # Optional one-shot historical replay on startup (format YYYY-MM-DD-H).
+      BACKFILL_START: ${BACKFILL_START:-}
+      BACKFILL_END: ${BACKFILL_END:-}
+      ENRICHMENT_MAX_REPOS: ${ENRICHMENT_MAX_REPOS:-100}
+    depends_on:
+      minio:
+        condition: service_started
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
 
   # ────────────────────────────────────────────────
   # SERVING
@@ -205,6 +259,7 @@ volumes:
   redpanda-data:
   timescale-data:
   redis-data:
+  minio-data:
   # These are managed by Docker. Data persists across `docker compose down`
   # but is deleted by `docker compose down -v`.
   # Unlike bind mounts, you cannot browse them directly in Finder/Explorer.

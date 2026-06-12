@@ -6,3 +6,4 @@ Tests/
 .DS_Store # Ignore macOS system files
 Docker/env
 .python_env/ # Ignore the Python virtual environment directory
+__pycache__/ # Ignore Python cache files

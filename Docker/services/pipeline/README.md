@@ -1,0 +1,84 @@
+# Pipeline service — the medallion orchestrator
+
+This container runs the batch **bronze → silver → gold** pipeline that powers the
+OSS Health Monitor. It is the *default* ingestion path. For the architectural
+reasoning (why MinIO, why DuckDB, why not Kafka for batch, etc.) read
+[`../../MEDALLION.md`](../../MEDALLION.md).
+
+## What it does
+
+| When | Job | Stages |
+|---|---|---|
+| Every hour (at :15) | `hourly_job` | bronze (download GH Archive hour → MinIO) → silver (typed/deduped Parquet → MinIO) → gold (metrics + ML risk → TimescaleDB + Redis) |
+| Daily (at 03:30 UTC) | `enrichment_job` | dependency-risk enrichment (GitHub SBOM → deps.dev → OSV) → bronze + TimescaleDB |
+| On startup (optional) | `backfill` | replay a fixed historical hour range once |
+
+## Files
+
+```
+main.py        scheduler entrypoint (APScheduler) + backfill
+pipeline.py    the DAG: run_hour(), run_enrichment()  ← lift this into Dagster/Airflow later
+bronze.py      download + integrity-check + land raw GH Archive in MinIO
+silver.py      DuckDB transform: raw JSON → typed, deduped, partitioned Parquet
+gold.py        DuckDB metric aggregation + bus factor + write to TimescaleDB/Redis
+risk_model.py  unsupervised IsolationForest "risk factor" (composite fallback)
+enrichment.py  deps.dev / OSV / GitHub SBOM dependency-risk dimension
+storage.py     MinIO client + DuckDB-over-S3 connection helpers
+config.py      all configuration, read from environment variables
+```
+
+## Run it
+
+From the `Docker/` directory:
+
+```bash
+cp .env.example .env          # then edit if you want (GITHUB_TOKEN, MinIO keys…)
+docker compose up --build     # default stack = medallion pipeline + serving
+```
+
+This starts: `minio`, `timescaledb`, `redis`, `pipeline`, `api`, `dashboard`.
+The pipeline runs one cycle immediately, then on schedule.
+
+- Dashboard:      http://localhost:8501
+- API docs:       http://localhost:8080/docs
+- MinIO console:  http://localhost:9001  (login = MINIO_ACCESS_KEY / MINIO_SECRET_KEY)
+
+### Backfill historical data
+
+```bash
+# in .env
+BACKFILL_START=2024-01-01-0
+BACKFILL_END=2024-01-01-23
+docker compose up --build
+```
+
+The service replays those hours once, then continues with live hourly processing.
+
+### Enable the optional real-time streaming path (Phase 3)
+
+```bash
+docker compose --profile streaming up --build
+```
+
+This additionally starts Redpanda + the ingestion/consumer workers. Not needed
+for the batch medallion pipeline.
+
+## Configuration (environment variables)
+
+All defaults live in [`config.py`](./config.py). The ones you are most likely to
+change are in [`../../.env.example`](../../.env.example): `MINIO_ACCESS_KEY`,
+`MINIO_SECRET_KEY`, `GITHUB_TOKEN`, `BACKFILL_START/END`, `ENRICHMENT_MAX_REPOS`.
+
+## How to extend it
+
+- **Add a metric**: add the aggregation to the SQL in `gold.py::_compute_features`,
+  add the column to `init/timescale/02_medallion.sql`, and add it to the INSERT in
+  `gold.py::_write_timescale`.
+- **Add a payload field to silver**: edit the projection in `silver.py`. Because
+  bronze is immutable, you can then *replay* (backfill) to rebuild silver/gold with
+  the new field — no re-download needed.
+- **Swap the orchestrator**: the stage functions in `pipeline.py` are plain Python.
+  Wrap them as Dagster assets or Airflow tasks with no change to bronze/silver/gold.
+- **Tune the ML model**: edit `risk_model.py` (features in `FEATURE_COLUMNS`, model
+  in `score_repos`). The trained model is persisted to `gold/models/` in MinIO.
+```
