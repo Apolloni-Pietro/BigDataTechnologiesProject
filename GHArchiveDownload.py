@@ -115,7 +115,7 @@ def convert_month_to_parquet(month_key):
                 'distinct_size': (payload->>'distinct_size')::INT,
                 'commits': list_transform(
                     CAST(payload->'commits' AS JSON[]),
-                    x -> {{'sha': json_extract_string(x, '$.sha'), 'author_name': json_extract_string(x, '$.author.name'), 'is_distinct': (json_extract_string(x, '$.distinct'))::BOOLEAN}}
+                    x -> {{'sha': json_extract_string(x, '$.sha'), 'author_name': json_extract_string(x, '$.author.name'), 'author_email': json_extract_string(x, '$.author.email'), 'is_distinct': (json_extract_string(x, '$.distinct'))::BOOLEAN}}
                 )
             }} ELSE NULL END AS payload_push,
 
