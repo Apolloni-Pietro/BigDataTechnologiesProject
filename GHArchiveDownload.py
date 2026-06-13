@@ -7,8 +7,8 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Configuration ---
-START_DATE = "2026-01-01" 
-END_DATE = "2026-01-31" 
+START_DATE = "2025-04-01" 
+END_DATE = "2025-04-30" 
 RAW_DIR = "./raw_json"
 PARQUET_DIR = "./processed_parquet"
 MAX_WORKERS = 35 # Edit according to available internet bandwidth
@@ -16,6 +16,16 @@ MAX_RETRIES = 3  # Download attempts per file before giving up
 
 os.makedirs(RAW_DIR, exist_ok=True)
 os.makedirs(PARQUET_DIR, exist_ok=True)
+
+# Shared HTTP session with a connection pool sized to the worker count, so the
+# hundreds of downloads reuse TCP/TLS connections to the CDN instead of doing a
+# fresh handshake per file. A single Session is safe to share across threads.
+SESSION = requests.Session()
+_adapter = requests.adapters.HTTPAdapter(
+    pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS
+)
+SESSION.mount("https://", _adapter)
+SESSION.mount("http://", _adapter)
 
 def is_valid_gzip(file_path):
     """Return True only if the file decompresses fully without error.
@@ -52,16 +62,31 @@ def download_single_file(file_name):
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            response = requests.get(url, stream=True, timeout=60)
+            response = SESSION.get(url, stream=True, timeout=60)
             if response.status_code == 200:
                 # Write to a temp file first so a partial write never lands as .json.gz
+                written = 0
                 with open(tmp_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
+                    for chunk in response.iter_content(chunk_size=65536):
                         f.write(chunk)
-                if is_valid_gzip(tmp_path):
+                        written += len(chunk)
+
+                # Completeness check. Truncation is the only realistic corruption
+                # mode for a static CDN object, and it manifests as fewer bytes
+                # than Content-Length. Comparing byte counts is essentially free,
+                # so we avoid decompressing the whole file (tens of GB/month).
+                # Only when the header is missing do we fall back to a full
+                # gzip-integrity decompress.
+                expected = int(response.headers.get("Content-Length", 0))
+                if expected > 0:
+                    complete = written == expected
+                else:
+                    complete = is_valid_gzip(tmp_path)
+
+                if complete:
                     os.replace(tmp_path, file_path)  # atomic rename
                     return f"Downloaded {file_name}"
-                last_error = "incomplete/corrupted archive"
+                last_error = f"incomplete archive ({written}/{expected or '?'} bytes)"
             elif response.status_code == 404:
                 # Some hours are genuinely absent on GH Archive; don't retry.
                 return f"[!] {file_name} not available (404)."
@@ -88,7 +113,11 @@ def convert_month_to_parquet(month_key):
     output_path = os.path.join(PARQUET_DIR, f"gh_events_{month_key}.parquet")
 
     con = duckdb.connect()
-    
+    # The output row order is irrelevant, so let DuckDB stream the COPY without
+    # buffering rows to preserve insertion order. This lowers memory pressure
+    # (fewer spills to disk) and improves parallelism on large months.
+    con.execute("SET preserve_insertion_order = false;")
+
     query = f"""
     COPY (
         SELECT 
@@ -107,141 +136,143 @@ def convert_month_to_parquet(month_key):
 
             -- 2. PushEvent
             CASE WHEN type = 'PushEvent' THEN {{
-                'push_id': (payload->>'push_id')::BIGINT,
-                'ref': payload->>'ref',
-                'head': payload->>'head',
-                'before': payload->>'before',
-                'size': (payload->>'size')::INT,
-                'distinct_size': (payload->>'distinct_size')::INT,
+                'push_id': (payload.push_id)::BIGINT,
+                'ref': payload.ref,
+                'head': payload.head,
+                'before': payload.before,
+                'size': (payload.size)::INT,
+                'distinct_size': (payload.distinct_size)::INT,
                 'commits': list_transform(
-                    CAST(payload->'commits' AS JSON[]),
-                    x -> {{'sha': json_extract_string(x, '$.sha'), 'author_name': json_extract_string(x, '$.author.name'), 'author_email': json_extract_string(x, '$.author.email'), 'is_distinct': (json_extract_string(x, '$.distinct'))::BOOLEAN}}
+                    payload.commits,
+                    x -> {{'sha': x.sha, 'author_name': x.author.name, 'author_email': x.author.email, 'is_distinct': (x."distinct")::BOOLEAN}}
                 )
             }} ELSE NULL END AS payload_push,
 
             -- 3. PullRequestEvent
             CASE WHEN type = 'PullRequestEvent' THEN {{
-                'action': payload->>'action',
-                'number': (payload->>'number')::INT,
-                'pr_id': (payload->'pull_request'->>'id')::BIGINT,
-                'state': payload->'pull_request'->>'state',
-                'draft': (payload->'pull_request'->>'draft')::BOOLEAN,
-                'merged': (payload->'pull_request'->>'merged')::BOOLEAN,
-                'author_association': payload->'pull_request'->>'author_association',
-                'created_at': (payload->'pull_request'->>'created_at')::TIMESTAMP,
-                'closed_at': (payload->'pull_request'->>'closed_at')::TIMESTAMP,
-                'merged_at': (payload->'pull_request'->>'merged_at')::TIMESTAMP,
-                'merged_by_login': payload->'pull_request'->'merged_by'->>'login',
-                'commits': (payload->'pull_request'->>'commits')::INT,
-                'additions': (payload->'pull_request'->>'additions')::INT,
-                'deletions': (payload->'pull_request'->>'deletions')::INT,
-                'changed_files': (payload->'pull_request'->>'changed_files')::INT,
-                'comments': (payload->'pull_request'->>'comments')::INT,
-                'review_comments': (payload->'pull_request'->>'review_comments')::INT,
-                'head_ref': payload->'pull_request'->'head'->>'ref',
-                'base_ref': payload->'pull_request'->'base'->>'ref'
+                'action': payload.action,
+                'number': (payload.number)::INT,
+                'pr_id': (payload.pull_request.id)::BIGINT,
+                'state': payload.pull_request.state,
+                'draft': (payload.pull_request.draft)::BOOLEAN,
+                'merged': (payload.pull_request.merged)::BOOLEAN,
+                'author_association': payload.pull_request.author_association,
+                'created_at': (payload.pull_request.created_at)::TIMESTAMP,
+                'closed_at': (payload.pull_request.closed_at)::TIMESTAMP,
+                'merged_at': (payload.pull_request.merged_at)::TIMESTAMP,
+                'merged_by_login': payload.pull_request.merged_by.login,
+                'commits': (payload.pull_request.commits)::INT,
+                'additions': (payload.pull_request.additions)::INT,
+                'deletions': (payload.pull_request.deletions)::INT,
+                'changed_files': (payload.pull_request.changed_files)::INT,
+                'comments': (payload.pull_request.comments)::INT,
+                'review_comments': (payload.pull_request.review_comments)::INT,
+                'head_ref': payload.pull_request.head.ref,
+                'base_ref': payload.pull_request.base.ref
             }} ELSE NULL END AS payload_pull_request,
 
             -- 4. IssuesEvent
             CASE WHEN type = 'IssuesEvent' THEN {{
-                'action': payload->>'action',
-                'issue_id': (payload->'issue'->>'id')::BIGINT,
-                'number': (payload->'issue'->>'number')::INT,
-                'state': payload->'issue'->>'state',
-                'state_reason': payload->'issue'->>'state_reason',
-                'author_association': payload->'issue'->>'author_association',
-                'created_at': (payload->'issue'->>'created_at')::TIMESTAMP,
-                'closed_at': (payload->'issue'->>'closed_at')::TIMESTAMP,
-                'comments': (payload->'issue'->>'comments')::INT,
-                'reactions_total': (payload->'issue'->'reactions'->>'total_count')::INT,
-                'labels': list_transform(
-                    CAST(payload->'issue'->'labels' AS JSON[]),
-                    x -> json_extract_string(x, '$.name')
-                )
+                'action': payload.action,
+                'issue_id': (payload.issue.id)::BIGINT,
+                'number': (payload.issue.number)::INT,
+                'state': payload.issue.state,
+                'state_reason': payload.issue.state_reason,
+                'author_association': payload.issue.author_association,
+                'created_at': (payload.issue.created_at)::TIMESTAMP,
+                'closed_at': (payload.issue.closed_at)::TIMESTAMP,
+                'comments': (payload.issue.comments)::INT,
+                'reactions_total': (payload.issue.reactions.total_count)::INT,
+                'labels': list_transform(payload.issue.labels, x -> x.name)
             }} ELSE NULL END AS payload_issue,
 
             -- 5. IssueCommentEvent
             CASE WHEN type = 'IssueCommentEvent' THEN {{
-                'action': payload->>'action',
-                'issue_number': (payload->'issue'->>'number')::INT,
-                'comment_id': (payload->'comment'->>'id')::BIGINT,
-                'author_association': payload->'comment'->>'author_association',
-                'reactions_total': (payload->'comment'->'reactions'->>'total_count')::INT
+                'action': payload.action,
+                'issue_number': (payload.issue.number)::INT,
+                'comment_id': (payload.comment.id)::BIGINT,
+                'author_association': payload.comment.author_association,
+                'reactions_total': (payload.comment.reactions.total_count)::INT
             }} ELSE NULL END AS payload_issue_comment,
 
             -- 6. PullRequestReviewEvent
             CASE WHEN type = 'PullRequestReviewEvent' THEN {{
-                'action': payload->>'action',
-                'pull_request_number': (payload->'pull_request'->>'number')::INT,
-                'review_id': (payload->'review'->>'id')::BIGINT,
-                'state': payload->'review'->>'state',
-                'author_association': payload->'review'->>'author_association'
+                'action': payload.action,
+                'pull_request_number': (payload.pull_request.number)::INT,
+                'review_id': (payload.review.id)::BIGINT,
+                'state': payload.review.state,
+                'author_association': payload.review.author_association
             }} ELSE NULL END AS payload_pr_review,
 
             -- 7. PullRequestReviewCommentEvent
             CASE WHEN type = 'PullRequestReviewCommentEvent' THEN {{
-                'action': payload->>'action',
-                'pull_request_number': (payload->'pull_request'->>'number')::INT,
-                'review_id': (payload->'comment'->>'pull_request_review_id')::BIGINT,
-                'comment_id': (payload->'comment'->>'id')::BIGINT,
-                'author_association': payload->'comment'->>'author_association',
-                'path': payload->'comment'->>'path',
-                'line': (payload->'comment'->>'line')::INT,
-                'reactions_total': (payload->'comment'->'reactions'->>'total_count')::INT
+                'action': payload.action,
+                'pull_request_number': (payload.pull_request.number)::INT,
+                'review_id': (payload.comment.pull_request_review_id)::BIGINT,
+                'comment_id': (payload.comment.id)::BIGINT,
+                'author_association': payload.comment.author_association,
+                'path': payload.comment.path,
+                'line': (payload.comment.line)::INT,
+                'reactions_total': (payload.comment.reactions.total_count)::INT
             }} ELSE NULL END AS payload_pr_review_comment,
 
             -- 8. CommitCommentEvent
             CASE WHEN type = 'CommitCommentEvent' THEN {{
-                'comment_id': (payload->'comment'->>'id')::BIGINT,
-                'commit_id': payload->'comment'->>'commit_id',
-                'author_association': payload->'comment'->>'author_association',
-                'path': payload->'comment'->>'path',
-                'line': (payload->'comment'->>'line')::INT,
-                'reactions_total': (payload->'comment'->'reactions'->>'total_count')::INT
+                'comment_id': (payload.comment.id)::BIGINT,
+                'commit_id': payload.comment.commit_id,
+                'author_association': payload.comment.author_association,
+                'path': payload.comment.path,
+                'line': (payload.comment.line)::INT,
+                'reactions_total': (payload.comment.reactions.total_count)::INT
             }} ELSE NULL END AS payload_commit_comment,
 
             -- 9. CreateEvent & DeleteEvent
             CASE WHEN type IN ('CreateEvent', 'DeleteEvent') THEN {{
-                'ref': payload->>'ref',
-                'ref_type': payload->>'ref_type',
-                'pusher_type': payload->>'pusher_type'
+                'ref': payload.ref,
+                'ref_type': payload.ref_type,
+                'pusher_type': payload.pusher_type
             }} ELSE NULL END AS payload_lifecycle,
 
             -- 10. ForkEvent
             CASE WHEN type = 'ForkEvent' THEN {{
-                'forkee_id': (payload->'forkee'->>'id')::BIGINT,
-                'full_name': payload->'forkee'->>'full_name',
-                'owner_login': payload->'forkee'->'owner'->>'login',
-                'is_private': (payload->'forkee'->>'private')::BOOLEAN
+                'forkee_id': (payload.forkee.id)::BIGINT,
+                'full_name': payload.forkee.full_name,
+                'owner_login': payload.forkee.owner.login,
+                'is_private': (payload.forkee.private)::BOOLEAN
             }} ELSE NULL END AS payload_fork,
 
             -- 11. ReleaseEvent
             CASE WHEN type = 'ReleaseEvent' THEN {{
-                'action': payload->>'action',
-                'release_id': (payload->'release'->>'id')::BIGINT,
-                'tag_name': payload->'release'->>'tag_name',
-                'draft': (payload->'release'->>'draft')::BOOLEAN,
-                'prerelease': (payload->'release'->>'prerelease')::BOOLEAN
+                'action': payload.action,
+                'release_id': (payload.release.id)::BIGINT,
+                'tag_name': payload.release.tag_name,
+                'draft': (payload.release.draft)::BOOLEAN,
+                'prerelease': (payload.release.prerelease)::BOOLEAN
             }} ELSE NULL END AS payload_release,
 
             -- 12. MemberEvent
             CASE WHEN type = 'MemberEvent' THEN {{
-                'action': payload->>'action',
-                'member_id': (payload->'member'->>'id')::BIGINT,
-                'member_login': payload->'member'->>'login',
-                'member_type': payload->'member'->>'type'
+                'action': payload.action,
+                'member_id': (payload.member.id)::BIGINT,
+                'member_login': payload.member.login,
+                'member_type': payload.member.type
             }} ELSE NULL END AS payload_member,
 
             -- 13. GollumEvent (Wiki)
             CASE WHEN type = 'GollumEvent' THEN {{
                 'pages': list_transform(
-                    CAST(payload->'pages' AS JSON[]),
-                    x -> {{'action': json_extract_string(x, '$.action'), 'page_name': json_extract_string(x, '$.page_name'), 'sha': json_extract_string(x, '$.sha')}}
+                    payload.pages,
+                    x -> {{'action': x.action, 'page_name': x.page_name, 'sha': x.sha}}
                 )
             }} ELSE NULL END AS payload_gollum
 
         FROM read_json('{glob_pattern}',
             format='newline_delimited',
+            -- Some GH events are a single, enormous JSON line (e.g. a PushEvent
+            -- with thousands of commits). DuckDB's per-object cap defaults to
+            -- 16 MiB, which a few hours exceed (2025-03-19-16 has a ~17.9 MB
+            -- line). Raise it generously so the month-wide read never aborts.
+            maximum_object_size=268435456,
             columns={{
                 'id': 'VARCHAR',
                 'type': 'VARCHAR',
@@ -250,7 +281,15 @@ def convert_month_to_parquet(month_key):
                 'actor': 'STRUCT(id BIGINT, login VARCHAR)',
                 'repo': 'STRUCT(id BIGINT, name VARCHAR)',
                 'org': 'STRUCT(id BIGINT, login VARCHAR)',
-                'payload': 'JSON'
+                -- Parse payload ONCE into a native nested struct instead of a
+                -- generic JSON blob. This is project-on-read: only the keys
+                -- listed here are extracted (the huge unused repo/user/base/head
+                -- sub-objects are skipped), and each field is then read by native
+                -- struct access in the SELECT above rather than re-parsed per
+                -- field. read_json silently ignores unmapped nested keys. Every
+                -- leaf is VARCHAR so casts stay in the SELECT (identical output
+                -- to the previous JSON-navigation version, just far cheaper).
+                'payload': 'STRUCT(push_id VARCHAR, ref VARCHAR, head VARCHAR, before VARCHAR, size VARCHAR, distinct_size VARCHAR, commits STRUCT(sha VARCHAR, author STRUCT(name VARCHAR, email VARCHAR), "distinct" VARCHAR)[], action VARCHAR, number VARCHAR, pull_request STRUCT(id VARCHAR, state VARCHAR, draft VARCHAR, merged VARCHAR, author_association VARCHAR, created_at VARCHAR, closed_at VARCHAR, merged_at VARCHAR, merged_by STRUCT(login VARCHAR), commits VARCHAR, additions VARCHAR, deletions VARCHAR, changed_files VARCHAR, comments VARCHAR, review_comments VARCHAR, number VARCHAR, head STRUCT(ref VARCHAR), base STRUCT(ref VARCHAR)), issue STRUCT(id VARCHAR, number VARCHAR, state VARCHAR, state_reason VARCHAR, author_association VARCHAR, created_at VARCHAR, closed_at VARCHAR, comments VARCHAR, reactions STRUCT(total_count VARCHAR), labels STRUCT(name VARCHAR)[]), comment STRUCT(id VARCHAR, author_association VARCHAR, reactions STRUCT(total_count VARCHAR), commit_id VARCHAR, path VARCHAR, line VARCHAR, pull_request_review_id VARCHAR), review STRUCT(id VARCHAR, state VARCHAR, author_association VARCHAR), ref_type VARCHAR, pusher_type VARCHAR, forkee STRUCT(id VARCHAR, full_name VARCHAR, owner STRUCT(login VARCHAR), private VARCHAR), release STRUCT(id VARCHAR, tag_name VARCHAR, draft VARCHAR, prerelease VARCHAR), member STRUCT(id VARCHAR, login VARCHAR, type VARCHAR), pages STRUCT(action VARCHAR, page_name VARCHAR, sha VARCHAR)[])'
             }}
         )
     ) TO '{output_path}' (
