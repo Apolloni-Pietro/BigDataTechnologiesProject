@@ -14,7 +14,7 @@ processed_parquet/
 .DS_Store
 
 # Ignore the Docker environment file which contains sensitive information
-Docker/env
+Docker/.env
 
 # Ignore Python cache files
 __pycache__/
