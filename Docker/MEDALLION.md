@@ -49,10 +49,13 @@ moving part with no benefit — you would be using a real-time transport for dat
 is intrinsically not real-time. The correct driver for an hourly batch pipeline is an
 **orchestrator/scheduler**, not a message bus.
 
-Redpanda earns its place only for the project's **future Phase 3** (the live GitHub
-Events API, which *is* a real-time firehose). So we keep Redpanda + the streaming
-workers, but behind a Docker Compose **`streaming` profile** that is off by default.
-The medallion batch pipeline is the default path and is completely independent of it.
+An earlier scaffold kept Redpanda plus an `ingestion-worker`/`consumer-worker` pair
+behind a `streaming` profile. **That subsystem has been removed**: it had no real
+data source — the `ingestion-worker` only ever emitted *synthetic* demo events — so
+it added moving parts and a second, conflicting writer to the gold tables while
+providing nothing real. A genuine real-time path (consuming the live GitHub Events
+API) would be a separate, honest implementation; the batch medallion pipeline is now
+the single, real ingestion path.
 
 ### ⚠️ Fix 3 — enrichment cannot run "every hour" on the same clock as ingestion
 deps.dev / OSV / the GitHub SBOM API are **external and rate-limited**, and a repo's
@@ -109,7 +112,6 @@ enrichment is unavailable, the activity metrics still flow (left join + an
 | **Gold (artifacts)** | **MinIO** `gold/` prefix | Trained ML model + optional aggregated Parquet snapshots for sharing/reproducibility. |
 | **Orchestration** | **APScheduler** inside a `pipeline` container | Triggers the bronze→silver→gold DAG hourly and enrichment daily. Lightweight, pure-Python, no extra infra. See the upgrade note below. |
 | **ML risk** | **scikit-learn IsolationForest** | The "risk factor" is unsupervised (we have no labelled "this repo failed" ground truth), so an anomaly-detection model that learns the normal feature distribution and flags outliers is the honest choice. Falls back to a deterministic weighted composite when there is too little data to train. |
-| **Streaming (optional, future)** | **Redpanda** + ingestion/consumer workers, `streaming` profile | Reserved for the real-time GitHub Events API path (Phase 3). Off by default. |
 
 ### Were TimescaleDB and Redis the right DBs? Yes — but only for *gold*
 The `add_docker` branch already chose TimescaleDB + Redis, and they are correct **for

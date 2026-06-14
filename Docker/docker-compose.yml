@@ -21,57 +21,6 @@ services:
     # does not reliably ship `mc`/`curl`. The pipeline service has its own
     # wait_for_minio() retry loop instead, so it depends on `service_started`.
 
-  # ── OPTIONAL streaming path (Phase 3) — off by default ──
-  # Redpanda + the ingestion/consumer workers form the real-time path (live
-  # GitHub Events API). They are gated behind the "streaming" profile because
-  # the hourly GH Archive ingest is intrinsically BATCH and must NOT be routed
-  # through a message bus. See MEDALLION.md §2 (Fix 2).
-  # Enable with:  docker compose --profile streaming up
-  redpanda:
-    image: docker.redpanda.com/redpandadata/redpanda:latest
-    container_name: oss-redpanda
-    profiles: ["streaming"]
-    command:
-      - redpanda
-      - start
-      - --mode dev-container
-      # dev-container disables performance checks that would
-      # otherwise require tuning the host OS. Fine for local use.
-      - --overprovisioned
-      # overprovisioned tells Redpanda not to complain about
-      # sharing CPU with other Docker containers.
-      - --smp 1
-      # smp = number of CPU cores Redpanda uses.
-      # 1 is enough for development.
-      - --memory 512M
-      - --reserve-memory 0M
-      - --node-id 0
-      - --kafka-addr PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
-      # Two listeners:
-      #   PLAINTEXT://  → used by containers INSIDE Docker network
-      #   OUTSIDE://    → used by tools on your HOST machine
-      - --advertise-kafka-addr PLAINTEXT://redpanda:29092,OUTSIDE://localhost:9092
-      # This tells clients which address to actually connect to.
-      # Containers use the Docker DNS name "redpanda" on port 29092.
-      # Your host machine uses localhost:9092.
-      - --check=false
-    ports:
-      - "9092:9092" # Kafka protocol — accessible from your laptop
-      - "9644:9644" # Admin API + Redpanda Console web UI
-    volumes:
-      - redpanda-data:/var/lib/redpanda/data
-    healthcheck:
-      # Docker will only mark this container healthy when this
-      # command succeeds. Other services wait for this before starting.
-      test: ["CMD-SHELL", "rpk cluster info --brokers localhost:9092 || exit 1"]
-      interval: 10s
-      timeout: 8s
-      retries: 10
-      start_period: 20s
-      # start_period gives Redpanda 20s to boot before health
-      # checks begin. Without this it fails on the first check
-      # and Docker marks it unhealthy before it has even started.
-
   timescaledb:
     image: timescale/timescaledb:latest-pg16
     container_name: oss-timescaledb
@@ -128,62 +77,10 @@ services:
       retries: 10
 
   # ────────────────────────────────────────────────
-  # WORKERS
+  # PIPELINE (the ingestion path)
   # ────────────────────────────────────────────────
 
-  ingestion-worker:
-    build:
-      context: ./services/ingestion
-      # context is the directory Docker uses as the build root.
-      # The Dockerfile at ./services/ingestion/Dockerfile will be used.
-    container_name: oss-ingestion
-    profiles: ["streaming"]
-    environment:
-      REDPANDA_BROKERS: redpanda:29092
-      # Note: this is the INTERNAL address (port 29092, not 9092).
-      # Containers talk to each other via the Docker internal network
-      # using the service name as the hostname. "redpanda" resolves to
-      # the Redpanda container's internal IP automatically.
-      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
-      INGESTION_START_DATE: ${INGESTION_START_DATE:-2024-01-01}
-    depends_on:
-      redpanda:
-        condition: service_healthy
-      # This container will not start until Redpanda passes its healthcheck.
-      # Without this, the Python Kafka producer would crash on startup
-      # because the broker is not yet ready to accept connections.
-    volumes:
-      - ./data/parquet:/app/data/parquet
-      # Bind mount: ./data/parquet on your HOST maps to /app/data/parquet
-      # INSIDE the container. Files written here persist on your machine.
-    restart: on-failure
-    # on-failure: restart if the process exits with a non-zero code
-    # (i.e. crashed), but do NOT restart if it exits cleanly with code 0.
-
-  consumer-worker:
-    build:
-      context: ./services/consumer
-    container_name: oss-consumer
-    profiles: ["streaming"]
-    environment:
-      REDPANDA_BROKERS: redpanda:29092
-      POSTGRES_DSN: postgresql://${POSTGRES_USER:-oss}:${POSTGRES_PASSWORD:-changeme}@timescaledb:5432/${POSTGRES_DB:-oss_health}
-      # Again: "timescaledb" is the Docker DNS hostname for that container.
-      REDIS_URL: redis://redis:6379
-      # "redis" is the Docker DNS hostname for the Redis container.
-      FLUSH_EVERY: "50"
-    depends_on:
-      redpanda:
-        condition: service_healthy
-      timescaledb:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    restart: unless-stopped
-    # unless-stopped: always restart on crash, EXCEPT if you explicitly
-    # ran `docker compose stop` or `docker compose down`.
-
-  # The medallion pipeline: the DEFAULT ingestion path. Hourly bronze->silver->
+  # The medallion pipeline: the ingestion path. Hourly bronze->silver->
   # gold over GH Archive, daily dependency-risk enrichment, ML risk scoring.
   pipeline:
     build:
@@ -256,7 +153,6 @@ services:
 # ────────────────────────────────────────────────
 
 volumes:
-  redpanda-data:
   timescale-data:
   redis-data:
   minio-data:
