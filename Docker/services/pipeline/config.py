@@ -46,6 +46,14 @@ COMMIT_FREQ_WINDOW_DAYS  = int(os.getenv("COMMIT_FREQ_WINDOW_DAYS", "30"))
 CONTRIBUTOR_WINDOW_DAYS  = int(os.getenv("CONTRIBUTOR_WINDOW_DAYS", "90"))
 STALE_ISSUE_DAYS         = int(os.getenv("STALE_ISSUE_DAYS", "90"))
 
+# ── Retention (24/7 disk management for MinIO; gold has its own retention) ───
+# Bronze is a transient landing zone -> short window. Silver is the history gold
+# aggregates over rolling windows, so it MUST outlive the largest window
+# (CONTRIBUTOR_WINDOW_DAYS) or metrics degrade at the edge.
+BRONZE_RETENTION_DAYS = int(os.getenv("BRONZE_RETENTION_DAYS", "30"))
+SILVER_RETENTION_DAYS = int(os.getenv("SILVER_RETENTION_DAYS", "120"))
+RETENTION_CRON_HOUR   = int(os.getenv("RETENTION_CRON_HOUR", "4"))   # daily, 04:45 UTC
+
 # Event types we keep in silver (everything else is noise for health metrics).
 TRACKED_EVENT_TYPES = (
     "PushEvent", "PullRequestEvent", "IssuesEvent", "IssueCommentEvent",

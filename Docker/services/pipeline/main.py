@@ -56,6 +56,13 @@ def enrichment_job() -> None:
         log.exception("enrichment_job failed")
 
 
+def retention_job() -> None:
+    try:
+        pipeline.run_retention()
+    except Exception:
+        log.exception("retention_job failed")
+
+
 def wait_for_minio(retries: int = 30) -> None:
     for attempt in range(1, retries + 1):
         try:
@@ -80,9 +87,12 @@ def main() -> None:
                       misfire_grace_time=3600, coalesce=True)
     scheduler.add_job(enrichment_job, "cron", hour=config.ENRICHMENT_CRON_HOUR,
                       minute=30, id="enrichment", misfire_grace_time=7200, coalesce=True)
+    scheduler.add_job(retention_job, "cron", hour=config.RETENTION_CRON_HOUR,
+                      minute=45, id="retention", misfire_grace_time=7200, coalesce=True)
     scheduler.start()
-    log.info("Scheduler started: hourly @ :15, enrichment daily @ %02d:30 UTC.",
-             config.ENRICHMENT_CRON_HOUR)
+    log.info("Scheduler started: hourly @ :15, enrichment daily @ %02d:30, "
+             "retention daily @ %02d:45 UTC.",
+             config.ENRICHMENT_CRON_HOUR, config.RETENTION_CRON_HOUR)
 
     # Run one cycle immediately so a fresh stack produces data without waiting.
     hourly_job()

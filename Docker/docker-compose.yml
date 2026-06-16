@@ -98,6 +98,10 @@ services:
       BACKFILL_START: ${BACKFILL_START:-}
       BACKFILL_END: ${BACKFILL_END:-}
       ENRICHMENT_MAX_REPOS: ${ENRICHMENT_MAX_REPOS:-100}
+      # Retention: prune aged MinIO objects so 24/7 operation doesn't fill disk.
+      BRONZE_RETENTION_DAYS: ${BRONZE_RETENTION_DAYS:-30}
+      SILVER_RETENTION_DAYS: ${SILVER_RETENTION_DAYS:-120}
+      RETENTION_CRON_HOUR: ${RETENTION_CRON_HOUR:-4}
     depends_on:
       minio:
         condition: service_started

@@ -10,6 +10,7 @@ import bronze
 import silver
 import gold
 import enrichment
+import retention
 import storage
 import config
 
@@ -66,3 +67,8 @@ def run_enrichment() -> None:
     log.info("── DAG: daily enrichment ──")
     repos = distinct_silver_repos(config.ENRICHMENT_MAX_REPOS)
     enrichment.run(repos)
+
+
+def run_retention() -> None:
+    """Daily prune of aged bronze/silver objects in MinIO (gold is unaffected)."""
+    retention.run()
