@@ -109,6 +109,7 @@ def build_hour(year: int, month: int, day: int, hour: int) -> str | None:
             }}
         )
         WHERE type IN {tuple(config.TRACKED_EVENT_TYPES)}
+          AND repo.name IS NOT NULL
         QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY created_at) = 1  -- dedup
     ) TO '{dst}' (FORMAT PARQUET, COMPRESSION 'ZSTD');
     """

@@ -95,9 +95,15 @@ def _compute_features() -> list[dict]:
         SELECT repo_name, MAX(event_timestamp) AS last_release
         FROM ev WHERE event_type = 'ReleaseEvent' GROUP BY 1
     ),
-    repos AS (SELECT DISTINCT repo_name FROM ev)
+    -- "importance" proxy: total tracked activity for the repo in the window.
+    -- Reuses the same signal the enrichment worklist ranks by (busiest first).
+    cnt AS (
+        SELECT repo_name, COUNT(*) AS event_count FROM ev GROUP BY 1
+    ),
+    repos AS (SELECT DISTINCT repo_name FROM ev WHERE repo_name IS NOT NULL)
     SELECT
         r.repo_name,
+        COALESCE(cnt.event_count, 0)                                   AS event_count,
         COALESCE(push.commits_window, 0) / {fw}.0                       AS commit_freq_30d,
         COALESCE(authors.active_contributors_90d, 0)                    AS active_contributors_90d,
         authors.author_commit_counts                                   AS author_commit_counts,
@@ -115,9 +121,10 @@ def _compute_features() -> list[dict]:
     LEFT JOIN pr      USING (repo_name)
     LEFT JOIN iss     USING (repo_name)
     LEFT JOIN rel     USING (repo_name)
+    LEFT JOIN cnt     USING (repo_name)
     """
     cols = [
-        "repo_name", "commit_freq_30d", "active_contributors_90d",
+        "repo_name", "event_count", "commit_freq_30d", "active_contributors_90d",
         "author_commit_counts", "days_since_last_commit", "pr_abandon_rate",
         "pr_latency_p50", "stale_issue_ratio", "days_since_last_release",
     ]
@@ -155,12 +162,13 @@ def _write_timescale(conn, rows: list[dict]) -> None:
             cur.execute(
                 """
                 INSERT INTO repo_health_metrics
-                    (time, repo_name, commit_freq_30d, active_contributors_90d,
+                    (time, repo_name, event_count, commit_freq_30d, active_contributors_90d,
                      bus_factor, pr_latency_p50, pr_abandon_rate, stale_issue_ratio,
                      days_since_last_commit, days_since_last_release, risk_score, health_score)
-                VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
-                (r["repo_name"], r["commit_freq_30d"], r["active_contributors_90d"],
+                (r["repo_name"], r["event_count"], r["commit_freq_30d"],
+                 r["active_contributors_90d"],
                  r["bus_factor"], r["pr_latency_p50"], r["pr_abandon_rate"],
                  r["stale_issue_ratio"], r["days_since_last_commit"],
                  r["days_since_last_release"], r["risk_score"], 1.0 - r["risk_score"]),

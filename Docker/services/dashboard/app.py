@@ -25,12 +25,12 @@ st.set_page_config(
 # Without this, every Streamlit re-render (e.g. a slider moving) would
 # fire a new HTTP request to FastAPI. With it, the same response is
 # reused for 30 seconds, then refreshed.
-def fetch_all_repos(max_score: float = 1.0) -> pd.DataFrame:
+def fetch_all_repos(max_score: float = 1.0, sort: str = "importance") -> pd.DataFrame:
     """Fetch all repos from the API and return as a DataFrame."""
     try:
         resp = requests.get(
             f"{API_URL}/repos",
-            params  = {"limit": 100, "max_score": max_score},
+            params  = {"limit": 100, "max_score": max_score, "sort": sort},
             timeout = 5,
         )
         resp.raise_for_status()
@@ -103,13 +103,25 @@ if page == "📊 Overview":
 
     col1, col2 = st.columns([3, 1])
     with col2:
+        sort_label = st.selectbox(
+            "Sort by",
+            ["Importance (activity)", "Health score", "Name"],
+            index=0,
+            help="Importance ranks by total tracked GitHub activity in the rolling window.",
+        )
         show_at_risk = st.checkbox("Show at-risk only", value=False)
         max_score    = 0.35 if show_at_risk else 1.0
 
-    df = fetch_all_repos(max_score=max_score)
+    sort_key = {
+        "Importance (activity)": "importance",
+        "Health score":          "health_score",
+        "Name":                  "name",
+    }[sort_label]
+
+    df = fetch_all_repos(max_score=max_score, sort=sort_key)
 
     if df.empty:
-        st.info("No data yet. Waiting for the consumer worker to process events...")
+        st.info("No data yet. The pipeline is still processing GitHub events — check back shortly.")
         st.stop()
 
     # Summary metrics at the top of the page

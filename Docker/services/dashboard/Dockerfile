@@ -10,7 +10,7 @@ WORKDIR /app
 
 # Install system-level dependencies first.
 # These are C libraries that some Python packages compile against.
-# gcc:       required to compile psycopg2 and confluent-kafka from source
+# gcc:       required to compile psycopg2 from source
 # libpq-dev: PostgreSQL client headers, required by psycopg2
 # curl:      used by the Docker healthcheck for the api and dashboard services
 # --no-install-recommends: do not install suggested packages (keeps image small)

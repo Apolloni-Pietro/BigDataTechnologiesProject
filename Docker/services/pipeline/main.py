@@ -38,7 +38,7 @@ def backfill() -> None:
     while cur <= end:
         pipeline.run_hour(cur)
         cur += timedelta(hours=1)
-    pipeline.run_enrichment()
+    # pipeline.run_enrichment()
     log.info("Backfill complete.")
 
 

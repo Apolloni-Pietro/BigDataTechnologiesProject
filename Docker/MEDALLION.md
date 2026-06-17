@@ -23,6 +23,7 @@ workload, and MinIO for bronze is a good call. But the plan as written has three
 gaps that would bite in a real deployment. Each is addressed in the implementation.
 
 ### ✅ What is right
+
 - **Medallion layering.** Raw-immutable → cleaned-conformed → business-ready is the
   industry-standard lakehouse pattern. It gives replayability (re-derive silver/gold
   from bronze after a bug fix without re-downloading), clear lineage, and a natural
@@ -34,15 +35,17 @@ gaps that would bite in a real deployment. Each is addressed in the implementati
 - **An ML model for the risk factor** fits the project's Phase 2 (anomaly detection).
 
 ### ⚠️ Fix 1 — "silver" is missing from the plan, but it is the most important layer
+
 The plan jumps from "store raw" (bronze) to "calculate metrics" to "gold". In a
 correct medallion design the **silver** layer sits in between and does the
 unglamorous but essential work: decompress, parse, **type**, **deduplicate**,
 explode payloads into a tabular event model, and partition by date. Metrics must be
-computed on *clean, conformed* data, not on raw JSON. We therefore make silver an
+computed on _clean, conformed_ data, not on raw JSON. We therefore make silver an
 explicit, materialised layer (typed Parquet on MinIO), and compute metrics as the
 **silver → gold** transform.
 
 ### ⚠️ Fix 2 — do **not** route hourly GH Archive through the streaming bus (Redpanda)
+
 GH Archive is **already an hourly batch** product: one `.json.gz` per hour, published
 on a delay. Pushing a batch file through Kafka/Redpanda just to read it back adds a
 moving part with no benefit — you would be using a real-time transport for data that
@@ -51,13 +54,14 @@ is intrinsically not real-time. The correct driver for an hourly batch pipeline 
 
 An earlier scaffold kept Redpanda plus an `ingestion-worker`/`consumer-worker` pair
 behind a `streaming` profile. **That subsystem has been removed**: it had no real
-data source — the `ingestion-worker` only ever emitted *synthetic* demo events — so
+data source — the `ingestion-worker` only ever emitted _synthetic_ demo events — so
 it added moving parts and a second, conflicting writer to the gold tables while
 providing nothing real. A genuine real-time path (consuming the live GitHub Events
 API) would be a separate, honest implementation; the batch medallion pipeline is now
 the single, real ingestion path.
 
 ### ⚠️ Fix 3 — enrichment cannot run "every hour" on the same clock as ingestion
+
 deps.dev / OSV / the GitHub SBOM API are **external and rate-limited**, and a repo's
 dependency risk barely changes hour to hour. Polling them on the hourly ingestion
 clock would (a) blow through API quotas and (b) couple a fast, reliable job to a slow,
@@ -72,13 +76,13 @@ enrichment is unavailable, the activity metrics still flow (left join + an
 
 ```
                     ┌──────────────────────── ORCHESTRATION ────────────────────────┐
-                    │            pipeline service (APScheduler, hourly + daily)       │
-                    └───────────────┬─────────────────────────────────┬──────────────┘
+                    │            pipeline service (APScheduler, hourly + daily)     │
+                    └───────────────┬──────────────────────────────────┬────────────┘
                                     │                                  │
             hourly                  ▼                 daily            ▼
-  GH Archive  ──────►  ┌─────────────────────┐    deps.dev/OSV ──►  (enrichment)
+  GH Archive  ──────►  ┌───────────────────-──┐    deps.dev/OSV ──►  (enrichment)
   data.gharchive.org   │      BRONZE          │    GitHub SBOM         │
-                       │   MinIO (object)     │◄──────────────────────┘
+                       │   MinIO (object)     │◄─────────────-─────────┘
                        │  raw .json.gz + raw  │
                        │  enrichment JSON     │
                        └──────────┬───────────┘
@@ -103,17 +107,18 @@ enrichment is unavailable, the activity metrics still flow (left join + an
 
 ### Layer-by-layer backend choices and the reasoning
 
-| Layer | Backend | Why this backend |
-|---|---|---|
-| **Bronze** | **MinIO** (S3-compatible object store) | Immutable raw landing zone. Object storage is cheap, append-only, infinitely replayable, and schema-on-read. S3 semantics mean the exact same code runs against AWS S3 in the cloud. DuckDB/Polars read it natively. This is the canonical bronze backend. |
-| **Silver** | **Parquet files on MinIO**, queried by **DuckDB** | Columnar, compressed (ZSTD), partitioned by `event_date`. DuckDB gives single-node, zero-server SQL over Parquet at GB–TB scale — no cluster to operate. Polars is interchangeable for dataframe work. Keeping silver as open Parquet (not locked in a DB) preserves the lakehouse property: any engine can read it. |
-| **Gold (history)** | **TimescaleDB** | Metrics are a **time-series** (one snapshot per repo per run). Hypertables auto-partition by time, continuous aggregates pre-roll daily summaries, native compression + retention policies keep it lean. This is exactly the access pattern the API's historical endpoints need. **Kept from the existing stack.** |
-| **Gold (hot)** | **Redis** (redis-stack: RedisTimeSeries) | Sub-millisecond "what is this repo's score right now?" lookups and short-window trend charts, off the critical path of the SQL database. **Kept from the existing stack.** |
-| **Gold (artifacts)** | **MinIO** `gold/` prefix | Trained ML model + optional aggregated Parquet snapshots for sharing/reproducibility. |
-| **Orchestration** | **APScheduler** inside a `pipeline` container | Triggers the bronze→silver→gold DAG hourly and enrichment daily. Lightweight, pure-Python, no extra infra. See the upgrade note below. |
-| **ML risk** | **scikit-learn IsolationForest** | The "risk factor" is unsupervised (we have no labelled "this repo failed" ground truth), so an anomaly-detection model that learns the normal feature distribution and flags outliers is the honest choice. Falls back to a deterministic weighted composite when there is too little data to train. |
+| Layer                | Backend                                           | Why this backend                                                                                                                                                                                                                                                                                                     |
+| -------------------- | ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Bronze**           | **MinIO** (S3-compatible object store)            | Immutable raw landing zone. Object storage is cheap, append-only, infinitely replayable, and schema-on-read. S3 semantics mean the exact same code runs against AWS S3 in the cloud. DuckDB/Polars read it natively. This is the canonical bronze backend.                                                           |
+| **Silver**           | **Parquet files on MinIO**, queried by **DuckDB** | Columnar, compressed (ZSTD), partitioned by `event_date`. DuckDB gives single-node, zero-server SQL over Parquet at GB–TB scale — no cluster to operate. Polars is interchangeable for dataframe work. Keeping silver as open Parquet (not locked in a DB) preserves the lakehouse property: any engine can read it. |
+| **Gold (history)**   | **TimescaleDB**                                   | Metrics are a **time-series** (one snapshot per repo per run). Hypertables auto-partition by time, continuous aggregates pre-roll daily summaries, native compression + retention policies keep it lean. This is exactly the access pattern the API's historical endpoints need. **Kept from the existing stack.**   |
+| **Gold (hot)**       | **Redis** (redis-stack: RedisTimeSeries)          | Sub-millisecond "what is this repo's score right now?" lookups and short-window trend charts, off the critical path of the SQL database. **Kept from the existing stack.**                                                                                                                                           |
+| **Gold (artifacts)** | **MinIO** `gold/` prefix                          | Trained ML model + optional aggregated Parquet snapshots for sharing/reproducibility.                                                                                                                                                                                                                                |
+| **Orchestration**    | **APScheduler** inside a `pipeline` container     | Triggers the bronze→silver→gold DAG hourly and enrichment daily. Lightweight, pure-Python, no extra infra. See the upgrade note below.                                                                                                                                                                               |
+| **ML risk**          | **scikit-learn IsolationForest**                  | The "risk factor" is unsupervised (we have no labelled "this repo failed" ground truth), so an anomaly-detection model that learns the normal feature distribution and flags outliers is the honest choice. Falls back to a deterministic weighted composite when there is too little data to train.                 |
 
-### Were TimescaleDB and Redis the right DBs? Yes — but only for *gold*
+### Were TimescaleDB and Redis the right DBs? Yes — but only for _gold_
+
 The `add_docker` branch already chose TimescaleDB + Redis, and they are correct **for
 the serving (gold) layer**. The mistake would be to use them for bronze/silver:
 
@@ -121,7 +126,7 @@ the serving (gold) layer**. The mistake would be to use them for bronze/silver:
   expensive, slow, and throw away the cheap-immutable-replayable property. MinIO is right.
 - **Silver is not a row-store problem.** Analytical metric aggregation over millions of
   events is a columnar/OLAP job (DuckDB over Parquet), not an OLTP row-store job.
-- **Gold *is* a serving problem**, and that is exactly where TimescaleDB (history) and
+- **Gold _is_ a serving problem**, and that is exactly where TimescaleDB (history) and
   Redis (hot) shine. So we keep both, unchanged, at the right layer.
 
 We did **not** adopt a table format (Apache Iceberg / Delta Lake) for silver/gold.
@@ -134,6 +139,7 @@ Iceberg-compatible so the migration is mechanical if scale ever demands it.
 ## 4. Why this is "optimal enough" and where it would scale
 
 **Deliberate simplifications (correct for this project's scale):**
+
 - **DuckDB instead of Spark/Trino.** Single-node DuckDB handles tens of GB of Parquet
   comfortably and needs no cluster. Spark would be operational overhead with no payoff
   here.
@@ -143,7 +149,8 @@ Iceberg-compatible so the migration is mechanical if scale ever demands it.
 - **Plain partitioned Parquet instead of Iceberg/Delta.**
 
 **Documented upgrade paths (when scale demands):**
-- Orchestration → **Dagster** (models bronze/silver/gold as software-defined *assets*,
+
+- Orchestration → **Dagster** (models bronze/silver/gold as software-defined _assets_,
   which maps 1:1 onto this design) or **Airflow**.
 - Silver/gold table format → **Apache Iceberg** on the same MinIO bucket (gives ACID,
   time-travel, schema evolution). DuckDB and Spark both read Iceberg.

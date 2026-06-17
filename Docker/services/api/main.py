@@ -87,37 +87,64 @@ def health_check():
     return {"status": "ok"}
 
 
+# Whitelist of allowed sort keys -> the SQL ORDER BY clause applied to the
+# latest-per-repo result set. Whitelisting (never interpolating the raw param)
+# keeps this safe from SQL injection.
+_SORT_CLAUSES = {
+    "importance":   "event_count DESC NULLS LAST",   # busiest repos first
+    "health_score": "health_score DESC NULLS LAST",  # healthiest first
+    "name":         "repo_name ASC",
+}
+
+
 @app.get("/repos")
-def list_repos(limit: int = 50, min_score: float = 0.0, max_score: float = 1.0):
+def list_repos(
+    limit: int = 50,
+    min_score: float = 0.0,
+    max_score: float = 1.0,
+    sort: str = "importance",
+):
     """
     List repositories with their latest health scores.
     Optionally filter by score range (e.g. max_score=0.35 for at-risk repos).
+    `sort` selects the ordering: importance (event volume), health_score, or name.
     Data comes from TimescaleDB — this is a historical/analytical query.
     """
     if not pg_conn:
         raise HTTPException(status_code=503, detail="Database not connected")
 
+    order_by = _SORT_CLAUSES.get(sort)
+    if order_by is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid sort '{sort}'. Allowed: {', '.join(_SORT_CLAUSES)}",
+        )
+
     try:
         with pg_conn.cursor() as cur:
             cur.execute(
-                """
-                SELECT DISTINCT ON (repo_name)
-                    repo_name,
-                    health_score,
-                    commit_freq_30d,
-                    bus_factor,
-                    stale_issue_ratio,
-                    time
-                FROM repo_health_metrics
-                WHERE health_score BETWEEN %s AND %s
-                ORDER BY repo_name, time DESC
+                # Inner query: latest row per repo (DISTINCT ON needs repo_name to
+                # lead its ORDER BY). Outer query: rank those latest rows.
+                f"""
+                SELECT * FROM (
+                    SELECT DISTINCT ON (repo_name)
+                        repo_name,
+                        health_score,
+                        commit_freq_30d,
+                        bus_factor,
+                        stale_issue_ratio,
+                        event_count,
+                        time
+                    FROM repo_health_metrics
+                    WHERE health_score BETWEEN %s AND %s
+                    ORDER BY repo_name, time DESC
+                ) latest
+                ORDER BY {order_by}
                 LIMIT %s
                 """,
                 (min_score, max_score, limit),
             )
             rows = cur.fetchall()
-            # DISTINCT ON (repo_name) ... ORDER BY repo_name, time DESC
-            # gives us the most recent row per repo. Standard PostgreSQL trick.
     except Exception as e:
         log.error(f"Database query failed: {e}")
         raise HTTPException(status_code=500, detail="Query failed")
@@ -130,11 +157,13 @@ def list_repos(limit: int = 50, min_score: float = 0.0, max_score: float = 1.0):
                 "commit_freq_30d":  row[2],
                 "bus_factor":       row[3],
                 "stale_issue_ratio": row[4],
-                "last_updated":     row[5].isoformat() if row[5] else None,
+                "event_count":      row[5],
+                "last_updated":     row[6].isoformat() if row[6] else None,
             }
             for row in rows
         ],
         "count": len(rows),
+        "sort":  sort,
     }
 
 
