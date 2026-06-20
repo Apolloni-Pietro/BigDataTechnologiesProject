@@ -79,7 +79,11 @@ def main() -> None:
     log.info("Pipeline service starting.")
     wait_for_minio()
 
-    if config.BACKFILL_START and config.BACKFILL_END:
+    # Parquet backfill (pre-downloaded monthly files) takes precedence over the
+    # hour-range download backfill; the two are mutually exclusive.
+    if config.BACKFILL_PARQUET_DIR:
+        pipeline.run_parquet_backfill()
+    elif config.BACKFILL_START and config.BACKFILL_END:
         backfill()
 
     scheduler = BackgroundScheduler(timezone="UTC")

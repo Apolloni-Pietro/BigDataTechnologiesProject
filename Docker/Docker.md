@@ -164,6 +164,7 @@ Copy `.env.example` to `.env` and edit. Never commit `.env` — it is in `.gitig
 | `MINIO_SECRET_KEY`      | `minioadmin` | MinIO root password / S3 secret key. Change if exposed to a network.                                            |
 | `BACKFILL_START`        | —            | Optional one-shot replay start, format `YYYY-MM-DD-H`. Empty = process new hours only.                          |
 | `BACKFILL_END`          | —            | Optional one-shot replay end, format `YYYY-MM-DD-H`.                                                            |
+| `BACKFILL_PARQUET_DIR`  | —            | Set to `/backfill` to ingest pre-downloaded monthly Parquet (precedence over `BACKFILL_START/END`). See `PARQUET_BACKFILL.md`. |
 | `ENRICHMENT_MAX_REPOS`  | `100`        | Cap on repos analysed per daily enrichment run (free-API rate-limit guard).                                     |
 | `BRONZE_RETENTION_DAYS` | `30`         | Delete bronze objects older than this. Bronze is a transient raw landing zone.                                  |
 | `SILVER_RETENTION_DAYS` | `120`        | Delete silver objects older than this. **Must stay ≥ 90** (the largest gold rolling window) or metrics degrade. |
@@ -249,7 +250,8 @@ The `pipeline` container runs these on an in-process scheduler (UTC):
 | On startup, once      | immediate run    | one `hourly_job` so a fresh stack isn't empty                                          |
 | Daily at `03:30`      | `enrichment_job` | dependency-risk enrichment (GitHub SBOM → deps.dev → OSV) → bronze + TimescaleDB       |
 | Daily at `04:45`      | `retention_job`  | prune bronze (>`BRONZE_RETENTION_DAYS`) and silver (>`SILVER_RETENTION_DAYS`) in MinIO |
-| On startup (optional) | `backfill`       | if `BACKFILL_START`/`BACKFILL_END` are set, replay that hour range once                |
+| On startup (optional) | `backfill`       | if `BACKFILL_START`/`BACKFILL_END` are set, replay that hour range once (downloads it) |
+| On startup (optional) | parquet backfill | if `BACKFILL_PARQUET_DIR` is set, ingest pre-downloaded monthly Parquet (precedence)   |
 
 **Backfill** (populate history fast): set the range in `.env`, then start the stack.
 
@@ -260,6 +262,12 @@ BACKFILL_END=2024-01-01-23
 
 Each stage is idempotent (bronze/silver skip objects already in MinIO), so backfills
 are resumable and safe to re-run.
+
+**Faster backfill from pre-downloaded Parquet.** If you already have monthly Parquet
+from the repo-root `GHArchiveDownload.py`, set `BACKFILL_PARQUET_DIR=/backfill` (the
+files are bind-mounted there) to re-project them straight into silver — ~6–10× faster,
+no re-download. Takes precedence over `BACKFILL_START/END`; run on a fresh silver bucket.
+Full guide: [`PARQUET_BACKFILL.md`](PARQUET_BACKFILL.md).
 
 ---
 

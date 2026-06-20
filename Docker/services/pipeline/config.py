@@ -41,10 +41,41 @@ ENRICHMENT_MAX_REPOS = int(os.getenv("ENRICHMENT_MAX_REPOS", "100"))
 BACKFILL_START = os.getenv("BACKFILL_START", "")
 BACKFILL_END   = os.getenv("BACKFILL_END", "")
 
+# Optional parquet backfill: ingest pre-downloaded monthly Parquet files
+# (produced by the repo-root GHArchiveDownload.py) instead of re-downloading from
+# GH Archive. When BACKFILL_PARQUET_DIR is set the service re-projects each
+# monthly file straight into silver, runs gold once, then continues with the
+# normal schedule. Takes PRECEDENCE over BACKFILL_START/END. Run on a fresh
+# silver bucket. See Docker/PARQUET_BACKFILL.md.
+BACKFILL_PARQUET_DIR  = os.getenv("BACKFILL_PARQUET_DIR", "")          # container path, e.g. /backfill
+BACKFILL_PARQUET_GLOB = os.getenv("BACKFILL_PARQUET_GLOB", "gh_events_*.parquet")
+
+# ── DuckDB resource caps (applied to every storage.duckdb_con) ──────────────
+# Heavy stages (the parquet backfill's per-day dedup, and especially gold's
+# 90-day aggregation with UNNEST over hundreds of millions of rows) must spill to
+# disk rather than grab all host RAM — otherwise DuckDB's default (~80% of RAM)
+# trips the Docker VM's OOM killer and the container restarts mid-run. A memory
+# limit + a temp/spill directory keeps every query within bounds.
+DUCKDB_MEMORY_LIMIT = os.getenv("DUCKDB_MEMORY_LIMIT", "10GB")
+DUCKDB_TEMP_DIR     = os.getenv("DUCKDB_TEMP_DIR", "/tmp/duckdb_spill")
+# Cap parallelism too: gold's 90-day aggregation builds large per-thread hash/list
+# partitions whose pinned (un-spillable) memory scales with thread count, so fewer
+# threads lowers peak memory markedly (at some speed cost) and lets it finish.
+DUCKDB_THREADS = os.getenv("DUCKDB_THREADS", "4")
+
 # ── Gold / metrics windows ─────────────────────────────────────────────────
 COMMIT_FREQ_WINDOW_DAYS  = int(os.getenv("COMMIT_FREQ_WINDOW_DAYS", "30"))
 CONTRIBUTOR_WINDOW_DAYS  = int(os.getenv("CONTRIBUTOR_WINDOW_DAYS", "90"))
 STALE_ISSUE_DAYS         = int(os.getenv("STALE_ISSUE_DAYS", "90"))
+
+# Gold repo cardinality bound. GH Archive's full firehose has tens of millions of
+# distinct repos per 90-day window (most with 1-2 events), which is neither
+# computable on a single node nor meaningful to monitor. Gold therefore scores only
+# the busiest repos: those with >= GOLD_MIN_EVENTS in the window, capped at the
+# GOLD_MAX_REPOS most active. This is the "health monitor watches real projects"
+# selection — and it bounds memory/IO/DB-write cost. Raise on bigger hardware.
+GOLD_MAX_REPOS  = int(os.getenv("GOLD_MAX_REPOS", "5000"))
+GOLD_MIN_EVENTS = int(os.getenv("GOLD_MIN_EVENTS", "10"))
 
 # ── Retention (24/7 disk management for MinIO; gold has its own retention) ───
 # Bronze is a transient landing zone -> short window. Silver is the history gold

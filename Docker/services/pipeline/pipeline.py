@@ -6,6 +6,9 @@ into Dagster/Airflow later without rewriting the stage logic.
 import logging
 from datetime import datetime, timedelta, timezone
 
+import glob
+import os
+
 import bronze
 import silver
 import gold
@@ -13,6 +16,7 @@ import enrichment
 import retention
 import storage
 import config
+import backfill_parquet
 
 log = logging.getLogger("pipeline.dag")
 
@@ -72,3 +76,30 @@ def run_enrichment() -> None:
 def run_retention() -> None:
     """Daily prune of aged bronze/silver objects in MinIO (gold is unaffected)."""
     retention.run()
+
+
+def run_parquet_backfill() -> None:
+    """Backfill silver+gold from pre-downloaded monthly Parquet files.
+
+    Re-projects each monthly file (repo-root GHArchiveDownload.py output) straight
+    into silver, then builds gold once and runs enrichment — mirroring backfill()'s
+    tail. Bronze is intentionally bypassed (the speed win). Intended to run on a
+    fresh silver bucket. See Docker/PARQUET_BACKFILL.md.
+    """
+    pattern = os.path.join(config.BACKFILL_PARQUET_DIR, config.BACKFILL_PARQUET_GLOB)
+    files = sorted(glob.glob(pattern))
+    if not files:
+        log.warning("parquet-backfill: no files match %s — nothing to do", pattern)
+        return
+
+    log.info("parquet-backfill: %d monthly file(s) to ingest", len(files))
+    for path in files:
+        try:
+            backfill_parquet.build_month(path)
+        except Exception:
+            log.exception("parquet-backfill: failed on %s", path)
+
+    gold.build()
+    repos = distinct_silver_repos(config.ENRICHMENT_MAX_REPOS)
+    enrichment.run(repos)
+    log.info("parquet-backfill complete.")

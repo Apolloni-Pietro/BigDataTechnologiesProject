@@ -96,6 +96,13 @@ BACKFILL_END=2024-01-31-23
 Each stage is idempotent (bronze/silver skip objects already in MinIO), so backfills
 are resumable and safe to re-run.
 
+**Faster: backfill from pre-downloaded Parquet.** Re-downloading months of hourly data
+is slow. If you already have monthly Parquet from the standalone
+[`GHArchiveDownload.py`](GHArchiveDownload.py), set `BACKFILL_PARQUET_DIR=/backfill` (its
+files are bind-mounted there) to ingest them straight into silver — ~6–10× faster, no
+re-download. It takes precedence over `BACKFILL_START/END`; run it on a fresh silver
+bucket. See [`Docker/PARQUET_BACKFILL.md`](Docker/PARQUET_BACKFILL.md).
+
 ### Retention
 
 Gold self-retains (TimescaleDB 2-year policy + Redis LRU/7-day series), but MinIO would

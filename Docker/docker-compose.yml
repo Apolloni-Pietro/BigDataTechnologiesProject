@@ -97,11 +97,20 @@ services:
       # Optional one-shot historical replay on startup (format YYYY-MM-DD-H).
       BACKFILL_START: ${BACKFILL_START:-}
       BACKFILL_END: ${BACKFILL_END:-}
+      # Optional parquet backfill: set to /backfill to ingest the pre-downloaded
+      # monthly Parquet files mounted below. Takes precedence over BACKFILL_START/END.
+      # See PARQUET_BACKFILL.md.
+      BACKFILL_PARQUET_DIR: ${BACKFILL_PARQUET_DIR:-}
+      DUCKDB_MEMORY_LIMIT: ${DUCKDB_MEMORY_LIMIT:-8GB}
       ENRICHMENT_MAX_REPOS: ${ENRICHMENT_MAX_REPOS:-100}
       # Retention: prune aged MinIO objects so 24/7 operation doesn't fill disk.
       BRONZE_RETENTION_DAYS: ${BRONZE_RETENTION_DAYS:-30}
       SILVER_RETENTION_DAYS: ${SILVER_RETENTION_DAYS:-120}
       RETENTION_CRON_HOUR: ${RETENTION_CRON_HOUR:-4}
+    volumes:
+      # Pre-downloaded monthly Parquet files (repo-root GHArchiveDownload.py output)
+      # for the parquet backfill. Read-only; harmless when BACKFILL_PARQUET_DIR is unset.
+      - ../processed_parquet:/backfill:ro
     depends_on:
       minio:
         condition: service_started

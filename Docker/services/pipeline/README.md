@@ -22,6 +22,7 @@ pipeline.py    the DAG: run_hour(), run_enrichment(), run_retention()  ← lift 
 bronze.py      download + integrity-check + land raw GH Archive in MinIO
 silver.py      DuckDB transform: raw JSON → typed, deduped, partitioned Parquet
 gold.py        DuckDB metric aggregation + bus factor + write to TimescaleDB/Redis
+backfill_parquet.py  re-project pre-downloaded monthly Parquet straight into silver
 risk_model.py  unsupervised IsolationForest "risk factor" (composite fallback)
 enrichment.py  deps.dev / OSV / GitHub SBOM dependency-risk dimension
 retention.py   prune aged bronze/silver objects from MinIO (gold has its own retention)
@@ -70,6 +71,12 @@ docker compose up --build
 ```
 
 The service replays those hours once, then continues with live hourly processing.
+
+**Faster path — pre-downloaded Parquet.** Set `BACKFILL_PARQUET_DIR=/backfill` to ingest
+monthly Parquet files (from the repo-root `GHArchiveDownload.py`) straight into silver,
+skipping download + JSON parsing. Takes precedence over `BACKFILL_START/END`; run on a
+fresh silver bucket. Implemented in `backfill_parquet.py` /
+`pipeline.run_parquet_backfill()`. Full guide: [`../../PARQUET_BACKFILL.md`](../../PARQUET_BACKFILL.md).
 
 ## Configuration (environment variables)
 

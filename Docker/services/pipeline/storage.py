@@ -69,6 +69,11 @@ def duckdb_con() -> duckdb.DuckDBPyConnection:
     con.execute(f"SET s3_secret_access_key='{config.MINIO_SECRET_KEY}';")
     con.execute(f"SET s3_use_ssl={'true' if config.MINIO_SECURE else 'false'};")
     con.execute("SET s3_url_style='path';")
+    # Bound memory and enable disk spill so heavy stages (gold's 90-day aggregation,
+    # the backfill dedup) don't OOM-kill the container. See config for the rationale.
+    con.execute(f"SET memory_limit='{config.DUCKDB_MEMORY_LIMIT}';")
+    con.execute(f"SET temp_directory='{config.DUCKDB_TEMP_DIR}';")
+    con.execute(f"SET threads={config.DUCKDB_THREADS};")
     return con
 
 

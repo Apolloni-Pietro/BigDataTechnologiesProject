@@ -47,9 +47,23 @@ def _compute_features() -> list[dict]:
     fw = config.COMMIT_FREQ_WINDOW_DAYS
 
     query = f"""
-    WITH ev AS (
+    WITH base AS (
         SELECT * FROM read_parquet('{src}', hive_partitioning=true)
         WHERE CAST(event_date AS DATE) >= current_date - {cw}
+          AND repo_name IS NOT NULL
+    ),
+    -- Cardinality bound: the firehose has tens of millions of repos in the window.
+    -- Restrict to the busiest GOLD_MAX_REPOS (with a GOLD_MIN_EVENTS floor) BEFORE
+    -- the heavy per-repo aggregations, so they run over a small, meaningful set.
+    eligible AS (
+        SELECT repo_name FROM base
+        GROUP BY repo_name
+        HAVING COUNT(*) >= {config.GOLD_MIN_EVENTS}
+        ORDER BY COUNT(*) DESC
+        LIMIT {config.GOLD_MAX_REPOS}
+    ),
+    ev AS (
+        SELECT * FROM base WHERE repo_name IN (SELECT repo_name FROM eligible)
     ),
     commits AS (
         SELECT repo_name, event_timestamp,
@@ -100,7 +114,7 @@ def _compute_features() -> list[dict]:
     cnt AS (
         SELECT repo_name, COUNT(*) AS event_count FROM ev GROUP BY 1
     ),
-    repos AS (SELECT DISTINCT repo_name FROM ev WHERE repo_name IS NOT NULL)
+    repos AS (SELECT repo_name FROM eligible)
     SELECT
         r.repo_name,
         COALESCE(cnt.event_count, 0)                                   AS event_count,
