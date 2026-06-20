@@ -107,7 +107,7 @@ if page == "📊 Overview":
             "Sort by",
             ["Importance (activity)", "Health score", "Name"],
             index=0,
-            help="Importance ranks by total tracked GitHub activity in the rolling window.",
+            help="Importance ranks by distinct active people (actors) in the rolling window — bot-resistant, unlike raw event volume.",
         )
         show_at_risk = st.checkbox("Show at-risk only", value=False)
         max_score    = 0.35 if show_at_risk else 1.0

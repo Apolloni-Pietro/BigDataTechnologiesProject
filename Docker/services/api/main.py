@@ -43,6 +43,11 @@ def get_connections():
     for attempt in range(1, 20):
         try:
             pg_conn = psycopg2.connect(POSTGRES_DSN)
+            # Autocommit so each request runs in its own implicit transaction and
+            # always sees the latest committed gold snapshot. Without this the single
+            # long-lived connection keeps one transaction open ("idle in
+            # transaction") and can serve a stale, frozen view of the metrics.
+            pg_conn.autocommit = True
             log.info("Connected to TimescaleDB")
             break
         except Exception as e:
@@ -91,8 +96,8 @@ def health_check():
 # latest-per-repo result set. Whitelisting (never interpolating the raw param)
 # keeps this safe from SQL injection.
 _SORT_CLAUSES = {
-    "importance":   "event_count DESC NULLS LAST",   # busiest repos first
-    "health_score": "health_score DESC NULLS LAST",  # healthiest first
+    "importance":   "active_actors DESC NULLS LAST",  # most distinct people first (bot-resistant)
+    "health_score": "health_score DESC NULLS LAST",   # healthiest first
     "name":         "repo_name ASC",
 }
 
@@ -107,7 +112,7 @@ def list_repos(
     """
     List repositories with their latest health scores.
     Optionally filter by score range (e.g. max_score=0.35 for at-risk repos).
-    `sort` selects the ordering: importance (event volume), health_score, or name.
+    `sort` selects the ordering: importance (distinct active actors), health_score, or name.
     Data comes from TimescaleDB — this is a historical/analytical query.
     """
     if not pg_conn:
@@ -133,6 +138,7 @@ def list_repos(
                         commit_freq_30d,
                         bus_factor,
                         stale_issue_ratio,
+                        active_actors,
                         event_count,
                         time
                     FROM repo_health_metrics
@@ -157,8 +163,9 @@ def list_repos(
                 "commit_freq_30d":  row[2],
                 "bus_factor":       row[3],
                 "stale_issue_ratio": row[4],
-                "event_count":      row[5],
-                "last_updated":     row[6].isoformat() if row[6] else None,
+                "active_actors":    row[5],
+                "event_count":      row[6],
+                "last_updated":     row[7].isoformat() if row[7] else None,
             }
             for row in rows
         ],

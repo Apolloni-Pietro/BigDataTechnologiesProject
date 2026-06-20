@@ -128,7 +128,15 @@ def build_month(local_path: str) -> int:
 
     total = 0
     for day in days:
-        dst = storage.s3_uri(config.SILVER_BUCKET, f"events/event_date={day}/data.parquet")
+        key = f"events/event_date={day}/data.parquet"
+        # Idempotency / resumability: a day already written (e.g. from an earlier
+        # run that crashed or was restarted) is skipped, so a restart re-reads only
+        # the cheap event_date column above and resumes where it left off instead of
+        # re-ingesting the whole month. Matches bronze/silver's skip-existing contract.
+        if storage.object_exists(config.SILVER_BUCKET, key):
+            log.info("backfill_parquet:   %s already built, skipping", day)
+            continue
+        dst = storage.s3_uri(config.SILVER_BUCKET, key)
         query = f"""
         COPY (
             SELECT {_PROJECTION}

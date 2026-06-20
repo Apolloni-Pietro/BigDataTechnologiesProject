@@ -71,11 +71,13 @@ STALE_ISSUE_DAYS         = int(os.getenv("STALE_ISSUE_DAYS", "90"))
 # Gold repo cardinality bound. GH Archive's full firehose has tens of millions of
 # distinct repos per 90-day window (most with 1-2 events), which is neither
 # computable on a single node nor meaningful to monitor. Gold therefore scores only
-# the busiest repos: those with >= GOLD_MIN_EVENTS in the window, capped at the
-# GOLD_MAX_REPOS most active. This is the "health monitor watches real projects"
-# selection — and it bounds memory/IO/DB-write cost. Raise on bigger hardware.
+# the most important repos, where importance = distinct active actors (people) in
+# the window — bot-resistant, unlike raw event volume. Keeps those with at least
+# GOLD_MIN_ACTORS distinct actors, capped at the GOLD_MAX_REPOS most active. This is
+# the "health monitor watches real projects" selection, and it bounds
+# memory/IO/DB-write cost. Raise on bigger hardware.
 GOLD_MAX_REPOS  = int(os.getenv("GOLD_MAX_REPOS", "5000"))
-GOLD_MIN_EVENTS = int(os.getenv("GOLD_MIN_EVENTS", "10"))
+GOLD_MIN_ACTORS = int(os.getenv("GOLD_MIN_ACTORS", "3"))
 
 # ── Retention (24/7 disk management for MinIO; gold has its own retention) ───
 # Bronze is a transient landing zone -> short window. Silver is the history gold

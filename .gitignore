@@ -18,3 +18,9 @@ Docker/.env
 
 # Ignore Python cache files
 __pycache__/
+
+# Ignore Agent files
+CLAUDE.md
+
+# Ignore the benchmark script
+bench_convert.py

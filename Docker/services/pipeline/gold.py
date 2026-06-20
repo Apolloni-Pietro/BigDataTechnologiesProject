@@ -58,8 +58,13 @@ def _compute_features() -> list[dict]:
     eligible AS (
         SELECT repo_name FROM base
         GROUP BY repo_name
-        HAVING COUNT(*) >= {config.GOLD_MIN_EVENTS}
-        ORDER BY COUNT(*) DESC
+        -- "Importance" = distinct active actors (people), not raw event volume:
+        -- a bot pushing 700K events is a single actor, so this resists the
+        -- push/comment spam that dominated event_count. approx_count_distinct
+        -- (HyperLogLog) makes ranking all ~22M repos cheap; the exact distinct
+        -- count is computed only for the chosen few in `cnt` below.
+        HAVING approx_count_distinct(actor_login) >= {config.GOLD_MIN_ACTORS}
+        ORDER BY approx_count_distinct(actor_login) DESC
         LIMIT {config.GOLD_MAX_REPOS}
     ),
     ev AS (
@@ -109,14 +114,20 @@ def _compute_features() -> list[dict]:
         SELECT repo_name, MAX(event_timestamp) AS last_release
         FROM ev WHERE event_type = 'ReleaseEvent' GROUP BY 1
     ),
-    -- "importance" proxy: total tracked activity for the repo in the window.
-    -- Reuses the same signal the enrichment worklist ranks by (busiest first).
+    -- Per-repo counts over the (already small, eligible-only) ev set:
+    --   active_actors = distinct people = the importance metric (exact here).
+    --   event_count   = raw tracked volume, kept as a secondary signal (a high
+    --                   event_count with a tiny active_actors flags bot activity).
     cnt AS (
-        SELECT repo_name, COUNT(*) AS event_count FROM ev GROUP BY 1
+        SELECT repo_name,
+               COUNT(*)                     AS event_count,
+               COUNT(DISTINCT actor_login)  AS active_actors
+        FROM ev GROUP BY 1
     ),
     repos AS (SELECT repo_name FROM eligible)
     SELECT
         r.repo_name,
+        COALESCE(cnt.active_actors, 0)                                 AS active_actors,
         COALESCE(cnt.event_count, 0)                                   AS event_count,
         COALESCE(push.commits_window, 0) / {fw}.0                       AS commit_freq_30d,
         COALESCE(authors.active_contributors_90d, 0)                    AS active_contributors_90d,
@@ -138,9 +149,10 @@ def _compute_features() -> list[dict]:
     LEFT JOIN cnt     USING (repo_name)
     """
     cols = [
-        "repo_name", "event_count", "commit_freq_30d", "active_contributors_90d",
-        "author_commit_counts", "days_since_last_commit", "pr_abandon_rate",
-        "pr_latency_p50", "stale_issue_ratio", "days_since_last_release",
+        "repo_name", "active_actors", "event_count", "commit_freq_30d",
+        "active_contributors_90d", "author_commit_counts", "days_since_last_commit",
+        "pr_abandon_rate", "pr_latency_p50", "stale_issue_ratio",
+        "days_since_last_release",
     ]
     rows = [dict(zip(cols, row)) for row in con.execute(query).fetchall()]
 
@@ -176,13 +188,14 @@ def _write_timescale(conn, rows: list[dict]) -> None:
             cur.execute(
                 """
                 INSERT INTO repo_health_metrics
-                    (time, repo_name, event_count, commit_freq_30d, active_contributors_90d,
-                     bus_factor, pr_latency_p50, pr_abandon_rate, stale_issue_ratio,
-                     days_since_last_commit, days_since_last_release, risk_score, health_score)
-                VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    (time, repo_name, active_actors, event_count, commit_freq_30d,
+                     active_contributors_90d, bus_factor, pr_latency_p50, pr_abandon_rate,
+                     stale_issue_ratio, days_since_last_commit, days_since_last_release,
+                     risk_score, health_score)
+                VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
-                (r["repo_name"], r["event_count"], r["commit_freq_30d"],
-                 r["active_contributors_90d"],
+                (r["repo_name"], r["active_actors"], r["event_count"],
+                 r["commit_freq_30d"], r["active_contributors_90d"],
                  r["bus_factor"], r["pr_latency_p50"], r["pr_abandon_rate"],
                  r["stale_issue_ratio"], r["days_since_last_commit"],
                  r["days_since_last_release"], r["risk_score"], 1.0 - r["risk_score"]),
