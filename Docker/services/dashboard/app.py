@@ -30,7 +30,7 @@ def fetch_all_repos(max_score: float = 1.0, sort: str = "importance") -> pd.Data
     try:
         resp = requests.get(
             f"{API_URL}/repos",
-            params  = {"limit": 100, "max_score": max_score, "sort": sort},
+            params  = {"limit": 1000, "max_score": max_score, "sort": sort},
             timeout = 5,
         )
         resp.raise_for_status()
@@ -124,12 +124,16 @@ if page == "📊 Overview":
         st.info("No data yet. The pipeline is still processing GitHub events — check back shortly.")
         st.stop()
 
+    # Convert decimal to percentage
+    if "health_score" in df.columns:
+        df["health_score"] = df["health_score"] * 100
+
     # Summary metrics at the top of the page
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Repos tracked",     len(df))
-    c2.metric("Avg health score",  f"{df['health_score'].mean():.2f}" if "health_score" in df.columns else "—")
-    c3.metric("At-risk repos",     len(df[df["health_score"] < 0.35]) if "health_score" in df.columns else "—")
-    c4.metric("Healthy repos",     len(df[df["health_score"] >= 0.70]) if "health_score" in df.columns else "—")
+    c2.metric("Avg health score",  f"{df['health_score'].mean():.1f}%" if "health_score" in df.columns else "—")
+    c3.metric("At-risk repos",     len(df[df["health_score"] < 35.0]) if "health_score" in df.columns else "—")
+    c4.metric("Healthy repos",     len(df[df["health_score"] >= 70.0]) if "health_score" in df.columns else "—")
 
     st.divider()
 
@@ -139,15 +143,15 @@ if page == "📊 Overview":
         def colour_score(val):
             try:
                 v = float(val)
-                if v < 0.35:
+                if v < 35.0:
                     return "background-color: #ffcccc"   # red
-                elif v < 0.70:
+                elif v < 70.0:
                     return "background-color: #fff4cc"   # yellow
                 else:
                     return "background-color: #ccffcc"   # green
             except (TypeError, ValueError):
                 return ""
-        styled = cast(Any, df.style).applymap(colour_score, subset=["health_score"])
+        styled = cast(Any, df.style).applymap(colour_score, subset=["health_score"]).format("{:.1f}%", subset=["health_score"])
         st.dataframe(styled, use_container_width=True)
     else:
         st.dataframe(df, use_container_width=True)
@@ -196,8 +200,8 @@ elif page == "🔎 Repository Detail":
 
         c1.metric(
             "Health score",
-            f"{float(metrics.get('health_score', 0)):.2f}",
-            help="Composite score from 0 (critical) to 1 (healthy)."
+            f"{float(metrics.get('health_score', 0)) * 100:.1f}%",
+            help="Composite score from 0% (critical) to 100% (healthy)."
         )
         c2.metric(
             "Bus factor",
@@ -223,6 +227,7 @@ elif page == "🔎 Repository Detail":
     if df_history.empty:
         st.info("No historical data available for this time window yet.")
     else:
+        df_history["health_score"] = df_history["health_score"] * 100
         st.line_chart(df_history["health_score"])
         st.caption(
             f"Source: {'Redis' if days <= 7 else 'TimescaleDB'}  |  "
