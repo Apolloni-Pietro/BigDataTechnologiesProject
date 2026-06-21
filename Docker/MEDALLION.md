@@ -60,15 +60,15 @@ providing nothing real. A genuine real-time path (consuming the live GitHub Even
 API) would be a separate, honest implementation; the batch medallion pipeline is now
 the single, real ingestion path.
 
-### ⚠️ Fix 3 — enrichment cannot run "every hour" on the same clock as ingestion
+### ⚠️ Fix 3 — keep external, rate-limited calls off the ingestion clock
 
-deps.dev / OSV / the GitHub SBOM API are **external and rate-limited**, and a repo's
-dependency risk barely changes hour to hour. Polling them on the hourly ingestion
-clock would (a) blow through API quotas and (b) couple a fast, reliable job to a slow,
-flaky one. Enrichment runs on its **own slower cadence** (default daily), lands its
-raw responses in **bronze** too, and is joined into gold opportunistically. If
-enrichment is unavailable, the activity metrics still flow (left join + an
-`enrichment_available` flag).
+A supply-chain enrichment path (GitHub SBOM → deps.dev → OSV) once ran on its own
+slower daily cadence so its external, rate-limited calls didn't couple to the fast
+hourly ingestion. **That path has since been removed**: it could only ever fetch the
+*current* dependency state, which is incoherent with the year-shifted replay the
+pipeline now supports, and it contributed only a small, usually-empty slice of the
+risk score. The principle still holds for any future external enrichment — give it its
+own cadence and never block ingestion on it.
 
 ---
 
@@ -77,21 +77,20 @@ enrichment is unavailable, the activity metrics still flow (left join + an
 ```
                     ┌──────────────────────── ORCHESTRATION ────────────────────────┐
                     │            pipeline service (APScheduler, hourly + daily)     │
-                    └───────────────┬──────────────────────────────────┬────────────┘
-                                    │                                  │
-            hourly                  ▼                 daily            ▼
-  GH Archive  ──────►  ┌───────────────────-──┐    deps.dev/OSV ──►  (enrichment)
-  data.gharchive.org   │      BRONZE          │    GitHub SBOM         │
-                       │   MinIO (object)     │◄─────────────-─────────┘
-                       │  raw .json.gz + raw  │
-                       │  enrichment JSON     │
+                    └───────────────┬───────────────────────────────────────────────┘
+                                    │
+            hourly                  ▼
+  GH Archive  ──────►  ┌──────────────────────┐
+  data.gharchive.org   │      BRONZE          │
+                       │   MinIO (object)     │
+                       │  raw .json.gz        │
                        └──────────┬───────────┘
                                   │  DuckDB: decompress, type, dedup, explode payloads
                                   ▼
                        ┌─────────────────────┐
                        │      SILVER          │   typed, partitioned Parquet
                        │   MinIO (object)     │   events/event_date=YYYY-MM-DD/hour=H.parquet
-                       │  one clean event tbl │   + dim_dependency_risk/
+                       │  one clean event tbl │
                        └──────────┬───────────┘
                                   │  DuckDB: per-repo metric aggregation  +  IsolationForest risk
                                   ▼
@@ -114,7 +113,7 @@ enrichment is unavailable, the activity metrics still flow (left join + an
 | **Gold (history)**   | **TimescaleDB**                                   | Metrics are a **time-series** (one snapshot per repo per run). Hypertables auto-partition by time, continuous aggregates pre-roll daily summaries, native compression + retention policies keep it lean. This is exactly the access pattern the API's historical endpoints need. **Kept from the existing stack.**   |
 | **Gold (hot)**       | **Redis** (redis-stack: RedisTimeSeries)          | Sub-millisecond "what is this repo's score right now?" lookups and short-window trend charts, off the critical path of the SQL database. **Kept from the existing stack.**                                                                                                                                           |
 | **Gold (artifacts)** | **MinIO** `gold/` prefix                          | Trained ML model + optional aggregated Parquet snapshots for sharing/reproducibility.                                                                                                                                                                                                                                |
-| **Orchestration**    | **APScheduler** inside a `pipeline` container     | Triggers the bronze→silver→gold DAG hourly and enrichment daily. Lightweight, pure-Python, no extra infra. See the upgrade note below.                                                                                                                                                                               |
+| **Orchestration**    | **APScheduler** inside a `pipeline` container     | Triggers the bronze→silver→gold DAG hourly and retention daily. Lightweight, pure-Python, no extra infra. See the upgrade note below.                                                                                                                                                                                |
 | **ML risk**          | **scikit-learn IsolationForest**                  | The "risk factor" is unsupervised (we have no labelled "this repo failed" ground truth), so an anomaly-detection model that learns the normal feature distribution and flags outliers is the honest choice. Falls back to a deterministic weighted composite when there is too little data to train.                 |
 
 ### Were TimescaleDB and Redis the right DBs? Yes — but only for _gold_
@@ -164,18 +163,16 @@ Iceberg-compatible so the migration is mechanical if scale ever demands it.
 
 - **Bronze object keys**
   - GH Archive: `gharchive/YYYY/MM/DD/YYYY-MM-DD-H.json.gz` (raw, untouched)
-  - Enrichment: `enrichment/sbom/<owner>__<repo>.json`, `enrichment/osv/<run_date>.json`
 - **Silver object keys**
-  - Events: `events/event_date=YYYY-MM-DD/hour=H.parquet`
-  - Dependency-risk dimension: `dim_dependency_risk/run_date=YYYY-MM-DD/data.parquet`
+  - Events (hourly): `events/event_date=YYYY-MM-DD/hour=H.parquet`
+  - Events (parquet backfill): `events/event_date=YYYY-MM-DD/data.parquet`
 - **Gold**
   - TimescaleDB `repo_health_metrics` (+ `risk_score`), continuous aggregate `repo_health_daily`
-  - TimescaleDB `repo_dependency_risk`
   - Redis `latest:<repo>` (hash) and `ts:<repo>:<metric>` (TimeSeries)
   - MinIO `gold/models/risk_isolation_forest.pkl`
 
 The **join key across everything is `repo_name`** (`owner/repo`), exactly as produced
-by `GHArchiveDownload.py` and consumed by `DependencyRisk.py`.
+by `GHArchiveDownload.py`.
 
 See [`services/pipeline/README.md`](./services/pipeline/README.md) for how to run,
 configure, backfill, and extend the pipeline.

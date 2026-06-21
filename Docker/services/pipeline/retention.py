@@ -20,6 +20,7 @@ from datetime import datetime, timezone, timedelta
 from minio.deleteobjects import DeleteObject
 
 import config
+import clock
 import storage
 
 log = logging.getLogger("pipeline.retention")
@@ -65,7 +66,9 @@ def _purge(bucket: str, prefix: str, cutoff: datetime) -> tuple[int, int]:
 
 
 def purge_bronze() -> int:
-    cutoff = datetime.now(timezone.utc) - timedelta(days=config.BRONZE_RETENTION_DAYS)
+    # Use the (possibly replay-shifted) clock so year-old replay data is not seen
+    # as expired and wiped. In non-replay mode effective_now() == real now.
+    cutoff = clock.effective_now() - timedelta(days=config.BRONZE_RETENTION_DAYS)
     deleted, kept = _purge(config.BRONZE_BUCKET, "", cutoff)
     log.info("retention bronze: deleted %d, kept %d (cutoff %d days)",
              deleted, kept, config.BRONZE_RETENTION_DAYS)
@@ -73,7 +76,7 @@ def purge_bronze() -> int:
 
 
 def purge_silver() -> int:
-    cutoff = datetime.now(timezone.utc) - timedelta(days=config.SILVER_RETENTION_DAYS)
+    cutoff = clock.effective_now() - timedelta(days=config.SILVER_RETENTION_DAYS)
     deleted, kept = _purge(config.SILVER_BUCKET, "events/", cutoff)
     log.info("retention silver: deleted %d, kept %d (cutoff %d days)",
              deleted, kept, config.SILVER_RETENTION_DAYS)

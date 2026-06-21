@@ -25,15 +25,20 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 
 # ── Sources ────────────────────────────────────────────────────────────────
 GHARCHIVE_BASE = os.getenv("GHARCHIVE_BASE", "https://data.gharchive.org")
-GITHUB_TOKEN   = os.getenv("GITHUB_TOKEN", "")        # for the SBOM API (optional)
 
 # ── Scheduling ─────────────────────────────────────────────────────────────
 # How the scheduler decides what to process. The pipeline always targets the
 # most recently *published* GH Archive hour (publication lags ~1h, so we look
 # back PUBLISH_LAG_HOURS).
 PUBLISH_LAG_HOURS    = int(os.getenv("PUBLISH_LAG_HOURS", "2"))
-ENRICHMENT_CRON_HOUR = int(os.getenv("ENRICHMENT_CRON_HOUR", "3"))   # daily, 03:00 UTC
-ENRICHMENT_MAX_REPOS = int(os.getenv("ENRICHMENT_MAX_REPOS", "100"))
+
+# ── Replay ─────────────────────────────────────────────────────────────────
+# Shift the pipeline's notion of "now" back this many years, so it fetches and
+# processes the feed from N years ago (e.g. 1 → exactly one year ago). 0 disables
+# replay (process the real latest hour). The data keeps its true dates; only the
+# reference clock shifts — see clock.py. Useful because older GH Archive data
+# carries full PushEvent commit arrays (newer/synthetic data may not).
+REPLAY_OFFSET_YEARS = int(os.getenv("REPLAY_OFFSET_YEARS", "0"))
 
 # Optional one-shot backfill on startup: "YYYY-MM-DD-H" .. "YYYY-MM-DD-H".
 # When BACKFILL_START is set the service processes that whole range once and

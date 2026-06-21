@@ -31,8 +31,6 @@ FEATURE_COLUMNS = [
     "pr_abandon_rate",        # higher = riskier
     "stale_issue_ratio",      # higher = riskier
     "days_since_last_commit", # higher = riskier
-    "open_advisory_count",    # higher = riskier
-    "outdated_dependency_ratio", # higher = riskier
 ]
 
 MIN_ROWS_TO_TRAIN = 30
@@ -45,25 +43,23 @@ def _composite(feats: dict) -> float:
             return 0.5
         return float(min(1.0, max(0.0, (v - lo) / (hi - lo))))
 
-    # Each term is oriented so that 1.0 = risky.
+    # Each term is oriented so that 1.0 = risky. Weights sum to 1.0 (the two
+    # supply-chain terms were removed with the enrichment path; the remaining six
+    # were rescaled to keep the score in [0, 1]).
     activity_risk   = 1.0 - norm(feats.get("commit_freq_30d"), 0, 5)
     contributor_risk= 1.0 - norm(feats.get("active_contributors_90d"), 1, 8)
     bus_risk        = 1.0 - norm(feats.get("bus_factor"), 1, 5)
     abandon_risk    = norm(feats.get("pr_abandon_rate"), 0, 1)
     stale_risk      = norm(feats.get("stale_issue_ratio"), 0, 1)
     freshness_risk  = norm(feats.get("days_since_last_commit"), 0, 180)
-    advisory_risk   = norm(feats.get("open_advisory_count"), 0, 5)
-    outdated_risk   = norm(feats.get("outdated_dependency_ratio"), 0, 1)
 
     return round(
-        activity_risk    * 0.20 +
-        contributor_risk * 0.15 +
-        bus_risk         * 0.15 +
-        abandon_risk     * 0.15 +
+        activity_risk    * 0.22 +
+        contributor_risk * 0.17 +
+        bus_risk         * 0.17 +
+        abandon_risk     * 0.17 +
         stale_risk       * 0.10 +
-        freshness_risk   * 0.15 +
-        advisory_risk    * 0.05 +
-        outdated_risk    * 0.05,
+        freshness_risk   * 0.17,
         4,
     )
 

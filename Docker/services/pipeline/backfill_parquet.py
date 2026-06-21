@@ -100,11 +100,13 @@ _PROJECTION = """
 """
 
 
-def build_month(local_path: str) -> int:
+def build_month(local_path: str, max_date: str | None = None) -> int:
     """Re-project one monthly Parquet file into silver, day by day.
 
     The monthly file is read locally; each day's deduped, re-projected rows are
     written to `silver/events/event_date=YYYY-MM-DD/data.parquet` on MinIO.
+    `max_date` (YYYY-MM-DD), when given, skips any day after it — used by the staged
+    replay so the parquet stage stops where the hourly/live stage takes over.
     Returns total silver rows written for the month.
     """
     con = storage.duckdb_con()  # memory_limit + temp_directory are set here (see storage)
@@ -128,6 +130,8 @@ def build_month(local_path: str) -> int:
 
     total = 0
     for day in days:
+        if max_date is not None and str(day) > max_date:
+            continue  # the hourly/live stage owns days after the cap
         key = f"events/event_date={day}/data.parquet"
         # Idempotency / resumability: a day already written (e.g. from an earlier
         # run that crashed or was restarted) is skipped, so a restart re-reads only

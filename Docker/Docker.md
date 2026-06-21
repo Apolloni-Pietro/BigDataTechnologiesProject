@@ -57,7 +57,7 @@ data and no streaming path; every number comes from real GitHub events.
 │  ── Orchestrator ─────────────┼──────────────────────┼─────────────────   │
 │  ┌────────────────────────────┴──────────────────────┴──────────────────┐ │
 │  │ pipeline (APScheduler)                                               │ │
-│  │  hourly: bronze → silver → gold     daily: enrichment + retention    │ │
+│  │  hourly: bronze → silver → gold              daily: retention        │ │
 │  └───────────────────────────────┬───────────────────┬──────────────────┘ │
 │                                  │ write gold        │ write gold         │
 │  ── Serving Stores ──────────────▼───────────────────▼─────────────────   │
@@ -88,7 +88,7 @@ Six containers. Three run from **prebuilt public images** (`minio`, `timescaledb
 
 | Layer  | Backend                  | Holds                                              | Retention                     |
 | ------ | ------------------------ | -------------------------------------------------- | ----------------------------- |
-| Bronze | MinIO (object)           | raw GH Archive `.json.gz` + raw enrichment JSON    | `BRONZE_RETENTION_DAYS` (30)  |
+| Bronze | MinIO (object)           | raw, immutable GH Archive `.json.gz`               | `BRONZE_RETENTION_DAYS` (30)  |
 | Silver | MinIO (Parquet) + DuckDB | cleaned, typed, deduplicated event table           | `SILVER_RETENTION_DAYS` (120) |
 | Gold   | TimescaleDB + Redis      | per-repo metrics, ML risk score, served to the API | TimescaleDB 2y / Redis 7d     |
 
@@ -106,8 +106,7 @@ daily **retention job** prunes aged bronze/silver objects (see
 - **RAM**: ≥ 6 GB available to Docker (8 GB recommended)
 - **Disk**: ≥ 20 GB free for a first run; more for long backfills (each GH Archive
   month is ~15–25 GB of bronze before retention prunes it)
-- **A GitHub token is _optional_** — only the daily dependency-risk enrichment
-  (GitHub SBOM API) uses it. Hourly GH Archive ingestion needs no token.
+- **No API tokens needed** — GH Archive is public and the pipeline downloads it directly.
 
 ---
 
@@ -159,15 +158,15 @@ Copy `.env.example` to `.env` and edit. Never commit `.env` — it is in `.gitig
 
 | Variable                | Default      | Description                                                                                                     |
 | ----------------------- | ------------ | --------------------------------------------------------------------------------------------------------------- |
-| `GITHUB_TOKEN`          | —            | Optional. Only for the daily dependency-risk enrichment (GitHub SBOM API). GH Archive needs no token.           |
 | `MINIO_ACCESS_KEY`      | `minioadmin` | MinIO root user / S3 access key.                                                                                |
 | `MINIO_SECRET_KEY`      | `minioadmin` | MinIO root password / S3 secret key. Change if exposed to a network.                                            |
 | `BACKFILL_START`        | —            | Optional one-shot replay start, format `YYYY-MM-DD-H`. Empty = process new hours only.                          |
 | `BACKFILL_END`          | —            | Optional one-shot replay end, format `YYYY-MM-DD-H`.                                                            |
 | `BACKFILL_PARQUET_DIR`  | —            | Set to `/backfill` to ingest pre-downloaded monthly Parquet (precedence over `BACKFILL_START/END`). See `PARQUET_BACKFILL.md`. |
-| `ENRICHMENT_MAX_REPOS`  | `100`        | Cap on repos analysed per daily enrichment run (free-API rate-limit guard).                                     |
+| `REPLAY_OFFSET_YEARS`   | `0`          | Shift the pipeline's "now" back N years (process the feed from N years ago). `0` = off. See `services/pipeline/clock.py`. |
+| `CONTRIBUTOR_WINDOW_DAYS` / `COMMIT_FREQ_WINDOW_DAYS` | `90` / `30` | Gold rolling-window sizes. Widen for a replay of an older single month. |
 | `BRONZE_RETENTION_DAYS` | `30`         | Delete bronze objects older than this. Bronze is a transient raw landing zone.                                  |
-| `SILVER_RETENTION_DAYS` | `120`        | Delete silver objects older than this. **Must stay ≥ 90** (the largest gold rolling window) or metrics degrade. |
+| `SILVER_RETENTION_DAYS` | `120`        | Delete silver objects older than this. **Must stay ≥ `CONTRIBUTOR_WINDOW_DAYS`** or metrics degrade.            |
 | `RETENTION_CRON_HOUR`   | `4`          | UTC hour for the daily retention sweep (runs at `:45`).                                                         |
 | `POSTGRES_USER`         | `oss`        | TimescaleDB username.                                                                                           |
 | `POSTGRES_PASSWORD`     | `changeme`   | TimescaleDB password. Change if the port is exposed.                                                            |
@@ -201,11 +200,9 @@ created automatically on first boot from `./init/timescale/01_schema.sql` and
 `02_medallion.sql`. Key objects:
 
 - **`repo_health_metrics`** hypertable — one row per repo per pipeline run
-  (`commit_freq_30d`, `active_contributors_90d`, `bus_factor`, `pr_latency_p50`,
-  `pr_abandon_rate`, `stale_issue_ratio`, `days_since_last_commit`,
-  `days_since_last_release`, `risk_score`, `health_score`).
-- **`repo_dependency_risk`** hypertable — supply-chain dimension from enrichment
-  (`declared_dependency_count`, `outdated_dependency_ratio`, `open_advisory_count`).
+  (`active_actors`, `event_count`, `commit_freq_30d`, `active_contributors_90d`,
+  `bus_factor`, `pr_latency_p50`, `pr_abandon_rate`, `stale_issue_ratio`,
+  `days_since_last_commit`, `days_since_last_release`, `risk_score`, `health_score`).
 - **`repo_health_daily`** continuous aggregate — daily rollup, refreshed hourly.
 - Compression after 7 days; retention drops data older than 2 years.
 
@@ -248,10 +245,10 @@ The `pipeline` container runs these on an in-process scheduler (UTC):
 | --------------------- | ---------------- | -------------------------------------------------------------------------------------- |
 | Every hour at `:15`   | `hourly_job`     | process the latest available GH Archive hour: bronze → silver → gold                   |
 | On startup, once      | immediate run    | one `hourly_job` so a fresh stack isn't empty                                          |
-| Daily at `03:30`      | `enrichment_job` | dependency-risk enrichment (GitHub SBOM → deps.dev → OSV) → bronze + TimescaleDB       |
 | Daily at `04:45`      | `retention_job`  | prune bronze (>`BRONZE_RETENTION_DAYS`) and silver (>`SILVER_RETENTION_DAYS`) in MinIO |
 | On startup (optional) | `backfill`       | if `BACKFILL_START`/`BACKFILL_END` are set, replay that hour range once (downloads it) |
 | On startup (optional) | parquet backfill | if `BACKFILL_PARQUET_DIR` is set, ingest pre-downloaded monthly Parquet (precedence)   |
+| On startup (optional) | replay           | if `REPLAY_OFFSET_YEARS>0`, shift "now" back N years: parquet bulk → hourly tail → live |
 
 **Backfill** (populate history fast): set the range in `.env`, then start the stack.
 
@@ -330,9 +327,6 @@ GOLD    — TimescaleDB (history) + Redis (hot) + MinIO gold/models
 api (FastAPI)  →  dashboard (Streamlit)
 ```
 
-Daily, enrichment (GitHub SBOM → deps.dev → OSV) lands raw responses in bronze and
-writes the `repo_dependency_risk` dimension to TimescaleDB, which gold joins in.
-
 ---
 
 ## Project Structure
@@ -348,16 +342,17 @@ Docker/
 ├── init/
 │   └── timescale/
 │       ├── 01_schema.sql        # base gold schema (auto-run on first boot)
-│       └── 02_medallion.sql     # risk_score column + repo_dependency_risk table
+│       └── 02_medallion.sql     # extra gold metric columns (active_actors, …)
 │
 └── services/
     ├── pipeline/                # the medallion orchestrator (built)
     │   ├── Dockerfile  requirements.txt  README.md
-    │   ├── main.py              # scheduler + backfill
-    │   ├── pipeline.py          # the DAG: run_hour / run_enrichment / run_retention
+    │   ├── main.py              # scheduler + backfill / replay startup
+    │   ├── pipeline.py          # the DAG: run_hour / run_parquet_backfill / run_retention
+    │   ├── clock.py             # the (replay-shiftable) "now"
     │   ├── bronze.py silver.py gold.py
     │   ├── risk_model.py        # IsolationForest risk score
-    │   ├── enrichment.py        # deps.dev / OSV / GitHub SBOM
+    │   ├── backfill_parquet.py  # re-project monthly Parquet into silver
     │   ├── retention.py         # prune aged bronze/silver in MinIO
     │   ├── storage.py config.py
     ├── api/                     # FastAPI (built)
@@ -388,10 +383,10 @@ docker compose exec timescaledb psql -U oss -d oss_health \
   -c "SELECT pg_size_pretty(pg_database_size('oss_health'));"
 ```
 
-**Enrichment finds nothing / 401**
-Enrichment needs `GITHUB_TOKEN` for the SBOM API; without it, repos report
-`enrichment_available = false` and the rest of the pipeline still runs. Check
-`docker compose logs pipeline` around the daily run.
+**Commit metrics (bus_factor, commit_freq_30d) are empty**
+Those derive from PushEvent `commits`/`size`. Some GH Archive data (and synthetic
+data) ships PushEvents without the commit array. Use `REPLAY_OFFSET_YEARS` to process
+older real data that carries it. See `services/pipeline/clock.py`.
 
 **Port already in use**
 Find the conflict (`lsof -i :8501`, etc.) and change the host-side number in the

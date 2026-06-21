@@ -10,25 +10,34 @@ reasoning (why MinIO, why DuckDB, why not Kafka for batch, etc.) read
 | When                  | Job              | Stages                                                                                                                              |
 | --------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
 | Every hour (at :15)   | `hourly_job`     | bronze (download GH Archive hour → MinIO) → silver (typed/deduped Parquet → MinIO) → gold (metrics + ML risk → TimescaleDB + Redis) |
-| Daily (at 03:30 UTC)  | `enrichment_job` | dependency-risk enrichment (GitHub SBOM → deps.dev → OSV) → bronze + TimescaleDB                                                    |
 | Daily (at 04:45 UTC)  | `retention_job`  | prune aged bronze/silver objects in MinIO so 24/7 operation doesn't fill disk                                                       |
 | On startup (optional) | `backfill`       | replay a fixed historical hour range once                                                                                           |
 
 ## Files
 
 ```
-main.py        scheduler entrypoint (APScheduler) + backfill
-pipeline.py    the DAG: run_hour(), run_enrichment(), run_retention()  ← lift into Dagster/Airflow later
+main.py        scheduler entrypoint (APScheduler) + backfill / replay startup
+pipeline.py    the DAG: run_hour(), run_parquet_backfill(), run_retention()  ← lift into Dagster/Airflow later
+clock.py       the (replay-shifted) "now" used by the scheduler, gold and retention
 bronze.py      download + integrity-check + land raw GH Archive in MinIO
 silver.py      DuckDB transform: raw JSON → typed, deduped, partitioned Parquet
 gold.py        DuckDB metric aggregation + bus factor + write to TimescaleDB/Redis
 backfill_parquet.py  re-project pre-downloaded monthly Parquet straight into silver
 risk_model.py  unsupervised IsolationForest "risk factor" (composite fallback)
-enrichment.py  deps.dev / OSV / GitHub SBOM dependency-risk dimension
 retention.py   prune aged bronze/silver objects from MinIO (gold has its own retention)
 storage.py     MinIO client + DuckDB-over-S3 connection helpers
 config.py      all configuration, read from environment variables
 ```
+
+## Replay mode (process the feed from N years ago)
+
+Set `REPLAY_OFFSET_YEARS` (e.g. `1`) to shift the pipeline's "now" back N years. The
+scheduler, gold's rolling windows, and retention all consult the single shifted clock in
+[`clock.py`](./clock.py), while the data keeps its true dates. Startup then runs, in
+order: the parquet bulk backfill (capped before the hourly window) → the hourly-download
+backfill (`BACKFILL_START` → the shifted latest hour) → live. Useful because older GH
+Archive data carries full PushEvent **commit arrays** (so bus factor / commit metrics
+populate), which some newer/synthetic data lacks.
 
 ## Retention (24/7 disk management)
 
@@ -42,15 +51,16 @@ MinIO is the only unbounded store (gold's TimescaleDB/Redis already self-retain)
   warning if this invariant is violated.
 
 Object age comes from the date in the key (`gharchive/YYYY/MM/DD/…`,
-`event_date=YYYY-MM-DD`), falling back to last-modified for dateless keys (e.g.
-enrichment blobs). Gold is never touched.
+`event_date=YYYY-MM-DD`), falling back to last-modified for dateless keys, and is
+compared against the (replay-aware) clock so a year-old replay is not wrongly pruned.
+Gold is never touched.
 
 ## Run it
 
 From the `Docker/` directory:
 
 ```bash
-cp .env.example .env          # then edit if you want (GITHUB_TOKEN, MinIO keys…)
+cp .env.example .env          # then edit if you want (MinIO keys, REPLAY_OFFSET_YEARS…)
 docker compose up --build     # default stack = medallion pipeline + serving
 ```
 
@@ -82,7 +92,7 @@ fresh silver bucket. Implemented in `backfill_parquet.py` /
 
 All defaults live in [`config.py`](./config.py). The ones you are most likely to
 change are in [`../../.env.example`](../../.env.example): `MINIO_ACCESS_KEY`,
-`MINIO_SECRET_KEY`, `GITHUB_TOKEN`, `BACKFILL_START/END`, `ENRICHMENT_MAX_REPOS`.
+`MINIO_SECRET_KEY`, `BACKFILL_START/END`, `BACKFILL_PARQUET_DIR`, `REPLAY_OFFSET_YEARS`.
 
 ## How to extend it
 

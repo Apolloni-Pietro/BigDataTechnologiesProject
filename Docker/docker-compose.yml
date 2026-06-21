@@ -81,7 +81,7 @@ services:
   # ────────────────────────────────────────────────
 
   # The medallion pipeline: the ingestion path. Hourly bronze->silver->
-  # gold over GH Archive, daily dependency-risk enrichment, ML risk scoring.
+  # gold over GH Archive, ML risk scoring.
   pipeline:
     build:
       context: ./services/pipeline
@@ -93,7 +93,6 @@ services:
       MINIO_SECURE: "false"
       POSTGRES_DSN: postgresql://${POSTGRES_USER:-oss}:${POSTGRES_PASSWORD:-changeme}@timescaledb:5432/${POSTGRES_DB:-oss_health}
       REDIS_URL: redis://redis:6379
-      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       # Optional one-shot historical replay on startup (format YYYY-MM-DD-H).
       BACKFILL_START: ${BACKFILL_START:-}
       BACKFILL_END: ${BACKFILL_END:-}
@@ -102,7 +101,13 @@ services:
       # See PARQUET_BACKFILL.md.
       BACKFILL_PARQUET_DIR: ${BACKFILL_PARQUET_DIR:-}
       DUCKDB_MEMORY_LIMIT: ${DUCKDB_MEMORY_LIMIT:-8GB}
-      ENRICHMENT_MAX_REPOS: ${ENRICHMENT_MAX_REPOS:-100}
+      # Replay: shift the pipeline's "now" back N years (0 = off). See clock.py.
+      REPLAY_OFFSET_YEARS: ${REPLAY_OFFSET_YEARS:-0}
+      # Rolling-window sizes (widen for a replay of an older single month).
+      CONTRIBUTOR_WINDOW_DAYS: ${CONTRIBUTOR_WINDOW_DAYS:-90}
+      COMMIT_FREQ_WINDOW_DAYS: ${COMMIT_FREQ_WINDOW_DAYS:-30}
+      # Filename glob for the parquet backfill (restrict to specific months).
+      BACKFILL_PARQUET_GLOB: ${BACKFILL_PARQUET_GLOB:-gh_events_*.parquet}
       # Retention: prune aged MinIO objects so 24/7 operation doesn't fill disk.
       BRONZE_RETENTION_DAYS: ${BRONZE_RETENTION_DAYS:-30}
       SILVER_RETENTION_DAYS: ${SILVER_RETENTION_DAYS:-120}

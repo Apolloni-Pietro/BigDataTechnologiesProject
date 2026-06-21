@@ -2,10 +2,13 @@
 
 Default behaviour:
   * every hour  -> process the latest available GH Archive hour (bronze->silver->gold)
-  * every day   -> run dependency-risk enrichment
+  * every day   -> prune aged bronze/silver (retention)
 
 Set BACKFILL_START / BACKFILL_END (format YYYY-MM-DD-H) to replay a historical
-range once on startup before the schedule takes over.
+range once on startup before the schedule takes over. Set REPLAY_OFFSET_YEARS to
+shift the whole pipeline's "now" back N years (see clock.py): startup then runs the
+parquet bulk backfill, the hourly-download backfill, then goes live — all targeting
+the feed from N years ago.
 """
 
 import logging
@@ -17,6 +20,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import config
 import storage
 import pipeline
+import gold
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,15 +34,18 @@ def _parse_hour(s: str) -> datetime:
     return datetime.strptime(s, "%Y-%m-%d-%H").replace(tzinfo=timezone.utc)
 
 
-def backfill() -> None:
-    """Replay a fixed [start, end] hour range once."""
-    start, end = _parse_hour(config.BACKFILL_START), _parse_hour(config.BACKFILL_END)
+def backfill(start: datetime, end: datetime) -> None:
+    """Download + process every hour in [start, end], building gold once at the end.
+
+    Gold is deferred (run_hour(..., with_gold=False)) so a multi-hour range doesn't
+    pay the ~minutes-long gold aggregation on every hour.
+    """
     log.info("Backfill from %s to %s", start, end)
     cur = start
     while cur <= end:
-        pipeline.run_hour(cur)
+        pipeline.run_hour(cur, with_gold=False)
         cur += timedelta(hours=1)
-    # pipeline.run_enrichment()
+    gold.build()
     log.info("Backfill complete.")
 
 
@@ -47,13 +54,6 @@ def hourly_job() -> None:
         pipeline.run_hour(pipeline.latest_available_hour())
     except Exception:
         log.exception("hourly_job failed")
-
-
-def enrichment_job() -> None:
-    try:
-        pipeline.run_enrichment()
-    except Exception:
-        log.exception("enrichment_job failed")
 
 
 def retention_job() -> None:
@@ -75,28 +75,46 @@ def wait_for_minio(retries: int = 30) -> None:
     raise RuntimeError("MinIO never became available.")
 
 
+def _replay_startup() -> None:
+    """Staged replay (REPLAY_OFFSET_YEARS > 0): parquet bulk -> hourly tail -> live.
+
+    The parquet stage ingests complete history up to the day before BACKFILL_START;
+    the hourly stage downloads BACKFILL_START .. the (shifted) latest hour; then the
+    scheduler takes over live. BACKFILL_START is optional — if unset, only the
+    parquet bulk runs (used by the single-file test).
+    """
+    if config.BACKFILL_PARQUET_DIR:
+        max_date = None
+        if config.BACKFILL_START:
+            start = _parse_hour(config.BACKFILL_START)
+            max_date = (start.date() - timedelta(days=1)).isoformat()
+        pipeline.run_parquet_backfill(max_date=max_date)
+    if config.BACKFILL_START:
+        backfill(_parse_hour(config.BACKFILL_START), pipeline.latest_available_hour())
+    log.info("Replay backfill complete; going live (%d year(s) ago).",
+             config.REPLAY_OFFSET_YEARS)
+
+
 def main() -> None:
     log.info("Pipeline service starting.")
     wait_for_minio()
 
-    # Parquet backfill (pre-downloaded monthly files) takes precedence over the
-    # hour-range download backfill; the two are mutually exclusive.
-    if config.BACKFILL_PARQUET_DIR:
+    if config.REPLAY_OFFSET_YEARS > 0:
+        _replay_startup()
+    # Otherwise: parquet backfill takes precedence over the hour-range backfill.
+    elif config.BACKFILL_PARQUET_DIR:
         pipeline.run_parquet_backfill()
     elif config.BACKFILL_START and config.BACKFILL_END:
-        backfill()
+        backfill(_parse_hour(config.BACKFILL_START), _parse_hour(config.BACKFILL_END))
 
     scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(hourly_job, "cron", minute=15, id="hourly",
                       misfire_grace_time=3600, coalesce=True)
-    scheduler.add_job(enrichment_job, "cron", hour=config.ENRICHMENT_CRON_HOUR,
-                      minute=30, id="enrichment", misfire_grace_time=7200, coalesce=True)
     scheduler.add_job(retention_job, "cron", hour=config.RETENTION_CRON_HOUR,
                       minute=45, id="retention", misfire_grace_time=7200, coalesce=True)
     scheduler.start()
-    log.info("Scheduler started: hourly @ :15, enrichment daily @ %02d:30, "
-             "retention daily @ %02d:45 UTC.",
-             config.ENRICHMENT_CRON_HOUR, config.RETENTION_CRON_HOUR)
+    log.info("Scheduler started: hourly @ :15, retention daily @ %02d:45 UTC.",
+             config.RETENTION_CRON_HOUR)
 
     # Run one cycle immediately so a fresh stack produces data without waiting.
     hourly_job()

@@ -4,7 +4,7 @@ A platform that continuously measures the **health of open-source software** on
 GitHub. It ingests public GitHub events from [GH Archive](https://www.gharchive.org/),
 organises them as a **bronze → silver → gold** medallion lakehouse, computes per-repo
 health metrics (commit cadence, bus factor, PR/issue responsiveness, release cadence,
-supply-chain risk), attaches an unsupervised **ML risk score**, and serves the result
+maintenance gaps), attaches an unsupervised **ML risk score**, and serves the result
 through a REST API and a live dashboard.
 
 All data is **real** — there is no synthetic/streaming demo path. GH Archive is an
@@ -54,7 +54,7 @@ The stack is six containers: `minio`, `timescaledb`, `redis`, `pipeline`, `api`,
 
 | Layer  | Backend                   | Role                                               |
 | ------ | ------------------------- | -------------------------------------------------- |
-| Bronze | MinIO (object store)      | raw, immutable GH Archive + enrichment JSON        |
+| Bronze | MinIO (object store)      | raw, immutable GH Archive `.json.gz`               |
 | Silver | Parquet on MinIO + DuckDB | cleaned, typed, deduplicated event table           |
 | Gold   | TimescaleDB + Redis       | per-repo metrics, ML risk score, served to the API |
 
@@ -63,9 +63,8 @@ The `pipeline` container orchestrates everything on an in-process scheduler (UTC
 | When                  | Job              | What it does                                                            |
 | --------------------- | ---------------- | ---------------------------------------------------------------------- |
 | Hourly at `:15`       | `hourly_job`     | latest GH Archive hour → bronze → silver → gold (metrics + ML risk)    |
-| Daily at `03:30`      | `enrichment_job` | dependency-risk enrichment (GitHub SBOM → deps.dev → OSV)              |
 | Daily at `04:45`      | `retention_job`  | prune aged bronze/silver in MinIO so 24/7 operation doesn't fill disk  |
-| On startup (optional) | `backfill`       | replay a fixed historical hour range once                              |
+| On startup (optional) | `backfill`       | replay a fixed historical hour range, or a year-shifted replay         |
 
 ---
 
@@ -75,10 +74,9 @@ Everything is configured via `Docker/.env` (copied from `.env.example`). The ful
 table lives in [`Docker/Docker.md`](Docker/Docker.md#environment-variables); the most
 relevant settings:
 
-- `GITHUB_TOKEN` — **optional**, only for the daily dependency-risk enrichment
-  (GitHub SBOM API). Hourly GH Archive ingestion needs no token.
 - `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` — object-store credentials.
 - `BACKFILL_START` / `BACKFILL_END` — optional one-shot history replay (`YYYY-MM-DD-H`).
+- `REPLAY_OFFSET_YEARS` — process the feed from N years ago (0 = off; see below).
 - `BRONZE_RETENTION_DAYS` (30) / `SILVER_RETENTION_DAYS` (120) — see [Retention](#retention).
 - `POSTGRES_*`, `REDIS_MAX_MEMORY` — database tuning.
 
@@ -102,6 +100,17 @@ is slow. If you already have monthly Parquet from the standalone
 files are bind-mounted there) to ingest them straight into silver — ~6–10× faster, no
 re-download. It takes precedence over `BACKFILL_START/END`; run it on a fresh silver
 bucket. See [`Docker/PARQUET_BACKFILL.md`](Docker/PARQUET_BACKFILL.md).
+
+### Replaying historical data (`REPLAY_OFFSET_YEARS`)
+
+Set `REPLAY_OFFSET_YEARS=1` to shift the pipeline's entire notion of "now" back one year,
+so it fetches and processes the feed from exactly a year ago and then runs "live" on
+year-old events. A single shifted clock ([`clock.py`](Docker/services/pipeline/clock.py))
+drives the scheduler, gold's rolling windows, and retention together — the data keeps its
+true dates. Startup runs parquet bulk → hourly tail → live, all year-shifted. This is
+useful because **older GH Archive data carries full PushEvent commit arrays**, so the
+commit-based metrics (bus factor, commit frequency, contributor count) populate — some
+newer/synthetic data omits them.
 
 ### Retention
 
@@ -143,16 +152,15 @@ python3 GHArchiveDownload.py     # edit START_DATE / END_DATE near the top first
 ```
 
 It creates `raw_json/` (raw `.json.gz`, emptied as each month finishes) and
-`processed_parquet/` (the kept output). See `DependencyRisk.py` for the standalone
-deps.dev/OSV supply-chain enrichment that joins on `repo_name`.
+`processed_parquet/` (the kept output, which the platform's `BACKFILL_PARQUET_DIR`
+path can ingest directly).
 
 ---
 
 ## Repository map
 
 ```
-GHArchiveDownload.py     standalone GH Archive → typed Parquet (bronze/silver logic)
-DependencyRisk.py        standalone supply-chain risk (deps.dev + OSV), keyed on repo_name
+GHArchiveDownload.py     standalone GH Archive → typed monthly Parquet (bronze/silver logic)
 Docker/                  the full Dockerised platform
   docker-compose.yml     the 6-container stack
   MEDALLION.md           architecture + design reasoning

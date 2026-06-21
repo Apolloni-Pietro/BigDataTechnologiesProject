@@ -40,8 +40,7 @@ GOLD (TimescaleDB + Redis)  ──►  API ──► dashboard
   Note it partitions by **`event_date` only** (not hour): live silver encodes hour in
   the *filename*, which DuckDB doesn't treat as a hive key, so matching the key set
   (`event_date` alone) avoids a "Hive partition mismatch" error on gold's combined read.
-- After all months are ingested, gold is built **once** and enrichment runs over the
-  busiest repos (mirroring the default backfill's tail).
+- After all months are ingested, gold is built **once** over the busiest repos.
 
 ---
 

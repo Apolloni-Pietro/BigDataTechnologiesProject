@@ -14,6 +14,7 @@ import psycopg2
 import redis as redis_lib
 
 import config
+import clock
 import storage
 import risk_model
 
@@ -46,10 +47,16 @@ def _compute_features() -> list[dict]:
     cw = config.CONTRIBUTOR_WINDOW_DAYS
     fw = config.COMMIT_FREQ_WINDOW_DAYS
 
+    # All "now"/"today" references below come from the (possibly replay-shifted)
+    # clock as SQL literals, so the rolling windows and recency math are relative
+    # to the logical now. In non-replay mode these equal real now/today.
+    eff_now = clock.effective_now().strftime("%Y-%m-%d %H:%M:%S")
+    eff_date = clock.effective_today().strftime("%Y-%m-%d")
+
     query = f"""
     WITH base AS (
         SELECT * FROM read_parquet('{src}', hive_partitioning=true)
-        WHERE CAST(event_date AS DATE) >= current_date - {cw}
+        WHERE CAST(event_date AS DATE) >= DATE '{eff_date}' - {cw}
           AND repo_name IS NOT NULL
     ),
     -- Cardinality bound: the firehose has tens of millions of repos in the window.
@@ -88,7 +95,7 @@ def _compute_features() -> list[dict]:
     ),
     push AS (
         SELECT repo_name,
-               SUM(CASE WHEN event_timestamp >= now() - INTERVAL '{fw} days'
+               SUM(CASE WHEN event_timestamp >= TIMESTAMP '{eff_now}' - INTERVAL '{fw} days'
                         THEN payload_push.size ELSE 0 END)         AS commits_window,
                MAX(event_timestamp)                                AS last_commit
         FROM ev WHERE event_type = 'PushEvent' GROUP BY 1
@@ -132,14 +139,14 @@ def _compute_features() -> list[dict]:
         COALESCE(push.commits_window, 0) / {fw}.0                       AS commit_freq_30d,
         COALESCE(authors.active_contributors_90d, 0)                    AS active_contributors_90d,
         authors.author_commit_counts                                   AS author_commit_counts,
-        date_diff('day', push.last_commit, now())                      AS days_since_last_commit,
+        date_diff('day', push.last_commit, TIMESTAMP '{eff_now}')      AS days_since_last_commit,
         CASE WHEN COALESCE(pr.pr_closed, 0) > 0
              THEN 1.0 - (pr.pr_merged::DOUBLE / pr.pr_closed) END       AS pr_abandon_rate,
         pr.pr_latency_p50                                              AS pr_latency_p50,
         CASE WHEN COALESCE(iss.issues_opened, 0) > 0
              THEN 1.0 - LEAST(1.0, iss.issues_closed::DOUBLE / iss.issues_opened)
         END                                                            AS stale_issue_ratio,
-        date_diff('day', rel.last_release, now())                      AS days_since_last_release
+        date_diff('day', rel.last_release, TIMESTAMP '{eff_now}')      AS days_since_last_release
     FROM repos r
     LEFT JOIN authors USING (repo_name)
     LEFT JOIN push    USING (repo_name)
@@ -160,26 +167,6 @@ def _compute_features() -> list[dict]:
     for r in rows:
         r["bus_factor"] = _bus_factor(r.pop("author_commit_counts"))
     return rows
-
-
-def _attach_dependency_risk(conn, rows: list[dict]) -> None:
-    """Merge the latest dependency-risk dimension (from gold) into the features."""
-    latest = {}
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT DISTINCT ON (repo_name)
-                   repo_name, open_advisory_count, outdated_dependency_ratio
-            FROM repo_dependency_risk
-            ORDER BY repo_name, time DESC
-            """
-        )
-        for repo, adv, ratio in cur.fetchall():
-            latest[repo] = (adv, ratio)
-    for r in rows:
-        adv, ratio = latest.get(r["repo_name"], (None, None))
-        r["open_advisory_count"] = adv
-        r["outdated_dependency_ratio"] = ratio
 
 
 def _write_timescale(conn, rows: list[dict]) -> None:
@@ -234,7 +221,6 @@ def build() -> int:
         return 0
 
     conn = psycopg2.connect(config.POSTGRES_DSN)
-    _attach_dependency_risk(conn, rows)
 
     scores = risk_model.score_repos(rows)
     for r in rows:
