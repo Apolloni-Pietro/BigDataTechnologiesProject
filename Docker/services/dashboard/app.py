@@ -161,12 +161,13 @@ elif page == "🔎 Repository Detail":
             st.warning("No metrics found via FastAPI for this repo yet.")
         else:
             metrics = data["metrics"]
+            # ── Quadratini dei KPI Corretti con i dati reali del Consumer ──
             c1, c2, c3, c4 = st.columns(4)
 
             c1.metric("Health Score", f"{float(metrics.get('health_score', 0)):.2f}")
             c2.metric("Bus Factor", metrics.get("bus_factor", "—"))
             c3.metric("Commit Freq (30d)", f"{float(metrics.get('commit_freq_30d', 0)):.1f}/day")
-            c4.metric("Stale Issue Ratio", f"{float(metrics.get('stale_issue_ratio', 0)) * 100:.0f}%")
+            c4.metric("Days Since Push", metrics.get("days_since_last_release", "—"))
 
             st.divider()
 
