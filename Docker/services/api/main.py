@@ -188,17 +188,70 @@ def get_current_metrics(repo_owner: str, repo_name: str):
     full_name = f"{repo_owner}/{repo_name}"
     data      = redis_client.hgetall(f"latest:{full_name}")
 
-    if not data:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No data found for {full_name}. "
-                   "It may not have been seen in the event stream yet."
-        )
+    if data:
+        return {
+            "repo":    full_name,
+            "metrics": data,
+            "source":  "redis",
+        }
 
+    # Redis is a hot cache, not durable storage: with `--save 60 1` +
+    # `allkeys-lru` the `latest:` hash can legitimately be missing (fresh start,
+    # un-saved window, eviction) even though the repo has metrics. Fall back to
+    # the latest committed row in TimescaleDB — the durable source of truth — so
+    # the endpoint stays correct whenever the cache is cold.
+    metrics = _latest_from_timescale(full_name)
+    if metrics:
+        return {
+            "repo":    full_name,
+            "metrics": metrics,
+            "source":  "timescaledb",
+        }
+
+    raise HTTPException(
+        status_code=404,
+        detail=f"No data found for {full_name}. "
+               "It may not have been seen in the event stream yet."
+    )
+
+
+# Columns mirror gold._write_timescale's INSERT. Kept here so the Redis-miss
+# fallback returns the same metric set the Redis `latest:` hash would.
+_CURRENT_COLUMNS = (
+    "active_actors", "event_count", "commit_freq_30d", "active_contributors_90d",
+    "bus_factor", "pr_latency_p50", "pr_abandon_rate", "stale_issue_ratio",
+    "days_since_last_commit", "days_since_last_release", "risk_score", "health_score",
+)
+
+
+def _latest_from_timescale(full_name: str) -> dict | None:
+    """Most recent metric row for one repo, as a str-valued dict (Redis-shaped)."""
+    if not pg_conn:
+        return None
+    try:
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT {', '.join(_CURRENT_COLUMNS)}
+                FROM repo_health_metrics
+                WHERE repo_name = %s
+                ORDER BY time DESC
+                LIMIT 1
+                """,
+                (full_name,),
+            )
+            row = cur.fetchone()
+    except Exception as e:
+        log.error(f"TimescaleDB current-metrics fallback failed: {e}")
+        return None
+
+    if not row:
+        return None
+
+    # Stringify to match the Redis hgetall shape the dashboard expects.
     return {
-        "repo":    full_name,
-        "metrics": data,
-        "source":  "redis",
+        col: ("" if val is None else str(val))
+        for col, val in zip(_CURRENT_COLUMNS, row)
     }
 
 

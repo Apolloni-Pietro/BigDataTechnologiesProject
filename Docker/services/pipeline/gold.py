@@ -193,24 +193,39 @@ def _write_timescale(conn, rows: list[dict]) -> None:
 def _write_redis(r_client, rows: list[dict]) -> None:
     ts = r_client.ts()
     now_ms = int(time.time() * 1000)
+    written = 0
+    failed = 0
     for r in rows:
-        mapping = {k: ("" if v is None else str(v)) for k, v in r.items()}
-        r_client.hset(f"latest:{r['repo_name']}", mapping=mapping)
-        for metric in ("risk_score", "health_score", "commit_freq_30d", "bus_factor"):
-            val = r.get(metric)
-            if val is None:
-                continue
-            key = f"ts:{r['repo_name']}:{metric}"
-            try:
-                ts.create(key, retention_msecs=REDIS_RETENTION_MS,
-                          labels={"repo": r["repo_name"], "metric": metric},
-                          duplicate_policy="LAST")
-            except redis_lib.ResponseError:
-                pass
-            try:
-                ts.add(key, now_ms, float(val))
-            except (redis_lib.ResponseError, ValueError):
-                pass
+        # Per-repo guard: one malformed repo can't abort the whole batch, and a
+        # wholesale Redis outage surfaces in the summary below instead of silently
+        # bubbling up to hourly_job. (Redis is a hot cache; the API falls back to
+        # TimescaleDB on a miss, so a failure here degrades latency, not data.)
+        try:
+            mapping = {k: ("" if v is None else str(v)) for k, v in r.items()}
+            r_client.hset(f"latest:{r['repo_name']}", mapping=mapping)
+            for metric in ("risk_score", "health_score", "commit_freq_30d", "bus_factor"):
+                val = r.get(metric)
+                if val is None:
+                    continue
+                key = f"ts:{r['repo_name']}:{metric}"
+                try:
+                    ts.create(key, retention_msecs=REDIS_RETENTION_MS,
+                              labels={"repo": r["repo_name"], "metric": metric},
+                              duplicate_policy="LAST")
+                except redis_lib.ResponseError:
+                    pass
+                try:
+                    ts.add(key, now_ms, float(val))
+                except (redis_lib.ResponseError, ValueError):
+                    pass
+            written += 1
+        except Exception:
+            failed += 1
+            if failed == 1:  # log the first failure with a traceback for diagnosis
+                log.exception("gold: redis write failed for %s", r.get("repo_name"))
+
+    log.info("gold: redis wrote %d/%d latest keys, %d failures",
+             written, len(rows), failed)
 
 
 def build() -> int:
@@ -230,8 +245,13 @@ def build() -> int:
     _write_timescale(conn, rows)
     conn.close()
 
-    r_client = redis_lib.Redis.from_url(config.REDIS_URL, decode_responses=True)
-    _write_redis(r_client, rows)
+    # TimescaleDB (above) is the durable write; Redis is the hot cache. Never let
+    # a Redis outage discard an already-committed gold cycle — log and move on.
+    try:
+        r_client = redis_lib.Redis.from_url(config.REDIS_URL, decode_responses=True)
+        _write_redis(r_client, rows)
+    except Exception:
+        log.exception("gold: redis phase failed; timescale write is already committed")
 
     log.info("gold: wrote %d repos at %s", len(rows), datetime.now(timezone.utc).isoformat())
     return len(rows)

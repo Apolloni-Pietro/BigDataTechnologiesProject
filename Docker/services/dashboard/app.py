@@ -10,6 +10,62 @@ import plotly.express as px
 # Questo è l'indirizzo del container dove gira FastAPI!
 API_URL = os.getenv("API_URL", "http://api:8080")
 
+# ── Metric presentation (friendly names + formatting) ─────────────────────
+# Raw internal metric keys -> user-friendly labels. Used for table headers,
+# KPI tiles and chart axes so naming stays consistent across every page.
+METRIC_LABELS = {
+    "repo_name":               "Repository",
+    "health_score":            "Health Score",
+    "risk_score":              "Risk Score",
+    "bus_factor":              "Bus Factor (contributors)",
+    "commit_freq_30d":         "Commits / Day (30d)",
+    "active_actors":           "Active Participants (90d)",
+    "active_contributors_90d": "Code Contributors (90d)",
+    "event_count":             "Total Events (90d)",
+    "pr_latency_p50":          "Median PR Merge Time (h)",
+    "pr_abandon_rate":         "PR Abandon Rate",
+    "stale_issue_ratio":       "Stale Issue Ratio",
+    "days_since_last_commit":  "Days Since Last Commit",
+    "days_since_last_release": "Days Since Last Release",
+    "last_updated":            "Last Updated",
+}
+
+# Metrics that are true 0–1 ratios -> shown as percentages (e.g. 65.8%).
+# NOTE: bus_factor is an integer head-count, NOT a ratio, so it stays a count.
+PERCENT_METRICS = {"health_score", "risk_score", "pr_abandon_rate", "stale_issue_ratio"}
+
+# Metrics that are whole numbers (counts / day deltas) -> render without decimals.
+INTEGER_METRICS = {
+    "bus_factor", "active_actors", "active_contributors_90d", "event_count",
+    "days_since_last_commit", "days_since_last_release",
+}
+
+
+def fmt_metric(key: str, value) -> str:
+    """Format a single metric value for display ('—' when missing)."""
+    if value is None or value == "" or value == "—":
+        return "—"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value)  # non-numeric (e.g. repo_name, last_updated)
+    if key in PERCENT_METRICS:
+        return f"{v * 100:.1f}%"
+    if key in INTEGER_METRICS:
+        return f"{int(round(v))}"
+    return f"{v:.2f}"  # remaining floats (commit_freq_30d, pr_latency_p50)
+
+
+def friendly_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Scale percent metrics to 0–100 and rename columns to friendly labels.
+
+    Returns a display-only copy; the caller's raw df is left untouched.
+    """
+    out = df.copy()
+    for col in PERCENT_METRICS & set(out.columns):
+        out[col] = pd.to_numeric(out[col], errors="coerce") * 100
+    return out.rename(columns=METRIC_LABELS)
+
 # ── Page setup ────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="OSS Health Monitor",
@@ -101,42 +157,51 @@ if page == "📊 Overview":
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Repos Tracked", len(df))
-    c2.metric("Avg Health Score", f"{df['health_score'].mean():.2f}" if "health_score" in df.columns else "—")
-    c3.metric("At-Risk Repos (<0.35)", len(df[df["health_score"] < 0.35]) if "health_score" in df.columns else "—")
-    c4.metric("Healthy Repos (>0.70)", len(df[df["health_score"] >= 0.70]) if "health_score" in df.columns else "—")
+    c2.metric("Avg Health Score", fmt_metric("health_score", df["health_score"].mean()) if "health_score" in df.columns else "—")
+    c3.metric("At-Risk Repos (<35%)", len(df[df["health_score"] < 0.35]) if "health_score" in df.columns else "—")
+    c4.metric("Healthy Repos (>70%)", len(df[df["health_score"] >= 0.70]) if "health_score" in df.columns else "—")
 
     st.divider()
 
     st.subheader("Health Score vs Bus Factor Distribution")
     if "health_score" in df.columns and "bus_factor" in df.columns:
         fig_scatter = px.scatter(
-            df, 
-            x="bus_factor", 
-            y="health_score", 
+            df,
+            x="bus_factor",
+            y="health_score",
             hover_data=["repo_name"],
             color="health_score",
             color_continuous_scale="RdYlGn",
-            title="Overview dei Progetti (Più è basso lo score, più è rosso)"
+            labels={
+                "bus_factor": METRIC_LABELS["bus_factor"],
+                "health_score": METRIC_LABELS["health_score"],
+                "repo_name": METRIC_LABELS["repo_name"],
+            },
+            title="Project Overview (lower score = more red = more fragile)",
         )
+        fig_scatter.update_yaxes(tickformat=".0%")
         st.plotly_chart(fig_scatter, use_container_width=True)
 
-    if "health_score" in df.columns:
+    # Friendly column names; percent metrics are scaled to 0–100 by friendly_df,
+    # so the colour thresholds below are on that same percentage scale.
+    df_display = friendly_df(df)
+    pct_fmt = {
+        METRIC_LABELS[k]: "{:.1f}%"
+        for k in PERCENT_METRICS
+        if METRIC_LABELS[k] in df_display.columns
+    }
+    health_col = METRIC_LABELS["health_score"]
+    styler = cast(Any, df_display.style).format(pct_fmt)
+    if health_col in df_display.columns:
         def colour_score(val):
             try:
                 v = float(val)
-                if v < 0.35: return "background-color: #ffcccc; color: black;"
-                elif v < 0.70: return "background-color: #fff4cc; color: black;"
+                if v < 35: return "background-color: #ffcccc; color: black;"
+                elif v < 70: return "background-color: #fff4cc; color: black;"
                 else: return "background-color: #ccffcc; color: black;"
             except (TypeError, ValueError): return ""
-        styled = cast(Any, df.style).applymap(colour_score, subset=["health_score"])
-        st.dataframe(styled, use_container_width=True)
-    else:
-        st.dataframe(df, use_container_width=True)
-
-    auto_refresh = st.checkbox("Auto-refresh every 30 seconds")
-    if auto_refresh:
-        time.sleep(30)
-        st.rerun()
+        styler = styler.applymap(colour_score, subset=[health_col])
+    st.dataframe(styler, use_container_width=True)
 
 # ── Page 2: Repository Detail ─────────────────────────────────────────────
 elif page == "🔎 Repository Detail":
@@ -163,13 +228,19 @@ elif page == "🔎 Repository Detail":
             st.warning("No metrics found via FastAPI for this repo yet.")
         else:
             metrics = data["metrics"]
-            # ── Quadratini dei KPI Corretti con i dati reali del Consumer ──
-            c1, c2, c3, c4 = st.columns(4)
-
-            c1.metric("Health Score", f"{float(metrics.get('health_score', 0)):.2f}")
-            c2.metric("Bus Factor", metrics.get("bus_factor", "—"))
-            c3.metric("Commit Freq (30d)", f"{float(metrics.get('commit_freq_30d', 0)):.1f}/day")
-            c4.metric("Days Since Last Release", metrics.get("days_since_last_release", "—"))
+            # All available metrics, friendly-named and formatted, in a 4-wide grid.
+            # Ordered with the headline health signals first; repo_name/internal
+            # keys are skipped (the raw payload is in the expander below).
+            display_order = [
+                "health_score", "risk_score", "bus_factor", "commit_freq_30d",
+                "active_actors", "active_contributors_90d", "event_count",
+                "pr_latency_p50", "pr_abandon_rate", "stale_issue_ratio",
+                "days_since_last_commit", "days_since_last_release",
+            ]
+            shown = [k for k in display_order if k in metrics]
+            cols = st.columns(4)
+            for i, key in enumerate(shown):
+                cols[i % 4].metric(METRIC_LABELS.get(key, key), fmt_metric(key, metrics.get(key)))
 
             st.divider()
 
@@ -181,10 +252,10 @@ elif page == "🔎 Repository Detail":
                 st.info("No historical data available for this time window yet.")
             else:
                 df_history.reset_index(inplace=True)
-                fig_line = px.line(df_history, x="time", y="health_score", 
+                fig_line = px.line(df_history, x="time", y="health_score",
                                    title="Health Score Over Time",
-                                   labels={"time": "Date", "health_score": "Score"})
-                fig_line.update_yaxes(range=[0, 1])
+                                   labels={"time": "Date", "health_score": METRIC_LABELS["health_score"]})
+                fig_line.update_yaxes(range=[0, 1], tickformat=".0%")
                 st.plotly_chart(fig_line, use_container_width=True)
 
             with st.expander("Raw API payload (From FastAPI)"):
@@ -210,8 +281,22 @@ elif page == "⚠️ At-Risk Projects":
             orientation="h",
             color="health_score",
             color_continuous_scale="Reds_r",
-            title="Top 15 Most Fragile Projects"
+            labels={
+                "health_score": METRIC_LABELS["health_score"],
+                "repo_name": METRIC_LABELS["repo_name"],
+            },
+            title="Top 15 Most Fragile Projects",
         )
+        fig_bar.update_xaxes(tickformat=".0%")
         st.plotly_chart(fig_bar, use_container_width=True)
 
-        st.dataframe(df_risk, use_container_width=True)
+        df_risk_display = friendly_df(df_risk)
+        pct_fmt = {
+            METRIC_LABELS[k]: "{:.1f}%"
+            for k in PERCENT_METRICS
+            if METRIC_LABELS[k] in df_risk_display.columns
+        }
+        st.dataframe(
+            cast(Any, df_risk_display.style).format(pct_fmt),
+            use_container_width=True,
+        )
