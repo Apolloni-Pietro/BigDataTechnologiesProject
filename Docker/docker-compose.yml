@@ -76,6 +76,16 @@ services:
       timeout: 5s
       retries: 10
 
+  mqtt:
+    image: eclipse-mosquitto:2
+    container_name: oss-mqtt
+    ports:
+      - "1883:1883"   # MQTT protocol (external clients)
+      - "9883:9883"   # MQTT over WebSockets (browser clients)
+    volumes:
+      - ./init/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    restart: unless-stopped
+
   # ────────────────────────────────────────────────
   # PIPELINE (the ingestion path)
   # ────────────────────────────────────────────────
@@ -112,6 +122,7 @@ services:
       BRONZE_RETENTION_DAYS: ${BRONZE_RETENTION_DAYS:-30}
       SILVER_RETENTION_DAYS: ${SILVER_RETENTION_DAYS:-120}
       RETENTION_CRON_HOUR: ${RETENTION_CRON_HOUR:-4}
+      MQTT_ALERT_THRESHOLD: ${MQTT_ALERT_THRESHOLD:-0.4}
     volumes:
       # Pre-downloaded monthly Parquet files (repo-root GHArchiveDownload.py output)
       # for the parquet backfill. Read-only; harmless when BACKFILL_PARQUET_DIR is unset.
@@ -123,6 +134,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      mqtt:
+        condition: service_started
     restart: unless-stopped
 
   # ────────────────────────────────────────────────

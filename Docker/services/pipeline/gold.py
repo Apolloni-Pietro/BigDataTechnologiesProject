@@ -17,6 +17,7 @@ import config
 import clock
 import storage
 import risk_model
+import mqtt_alerts
 
 log = logging.getLogger("pipeline.gold")
 
@@ -230,6 +231,19 @@ def _write_redis(r_client, rows: list[dict]) -> None:
 
 def build() -> int:
     """Compute gold for all repos in the silver window. Returns repo count."""
+    # Snapshot previous health scores before overwriting Redis — needed for
+    # edge-triggered MQTT alerts (detect threshold crossings, not steady state).
+    prev_scores: dict[str, str | None] = {}
+    try:
+        _snap = redis_lib.Redis.from_url(config.REDIS_URL, decode_responses=True)
+        prev_scores = {
+            key.removeprefix("latest:"): _snap.hget(key, "health_score")
+            for key in _snap.scan_iter("latest:*")
+        }
+        _snap.close()
+    except Exception:
+        log.warning("gold: could not snapshot prev scores for MQTT diff (non-fatal)")
+
     rows = _compute_features()
     if not rows:
         log.info("gold: no silver data in window yet")
@@ -252,6 +266,8 @@ def build() -> int:
         _write_redis(r_client, rows)
     except Exception:
         log.exception("gold: redis phase failed; timescale write is already committed")
+
+    mqtt_alerts.publish_alerts(rows, prev_scores)
 
     log.info("gold: wrote %d repos at %s", len(rows), datetime.now(timezone.utc).isoformat())
     return len(rows)
