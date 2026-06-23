@@ -127,9 +127,11 @@ if page == "📊 Overview":
                 if v < 0.35: return "background-color: #ffcccc; color: black;"
                 elif v < 0.70: return "background-color: #fff4cc; color: black;"
                 else: return "background-color: #ccffcc; color: black;"
-            except: return ""
+            except (TypeError, ValueError): return ""
         styled = cast(Any, df.style).applymap(colour_score, subset=["health_score"])
         st.dataframe(styled, use_container_width=True)
+    else:
+        st.dataframe(df, use_container_width=True)
 
     auto_refresh = st.checkbox("Auto-refresh every 30 seconds")
     if auto_refresh:
