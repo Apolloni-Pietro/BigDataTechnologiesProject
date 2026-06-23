@@ -257,6 +257,15 @@ def build() -> int:
         r["health_score"] = round(1.0 - r["risk_score"], 4)
 
     _write_timescale(conn, rows)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "CALL refresh_continuous_aggregate('repo_health_daily', NOW() - INTERVAL '2 days', NOW());"
+            )
+        conn.commit()
+        log.info("gold: refreshed repo_health_daily continuous aggregate")
+    except Exception:
+        log.warning("gold: continuous aggregate refresh failed (non-fatal)")
     conn.close()
 
     # TimescaleDB (above) is the durable write; Redis is the hot cache. Never let

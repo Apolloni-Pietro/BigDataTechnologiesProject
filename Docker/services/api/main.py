@@ -311,6 +311,30 @@ def get_metric_history(repo_owner: str, repo_name: str, days: int = 7):
                     (full_name, str(days)),
                 )
                 rows = cur.fetchall()
+
+                # Continuous aggregate refreshes hourly; on a fresh stack it may not
+                # have materialized yet even though raw rows exist. Fall back to the
+                # hypertable with a manual daily bucket so data is visible immediately.
+                if not rows:
+                    log.info(
+                        "repo_health_daily empty for %s (days=%d), falling back to raw hypertable",
+                        full_name, days,
+                    )
+                    cur.execute(
+                        """
+                        SELECT
+                            time_bucket('1 day', time) AS day,
+                            AVG(health_score)           AS health_score_avg,
+                            MIN(health_score)           AS health_score_min
+                        FROM repo_health_metrics
+                        WHERE repo_name = %s
+                          AND time >= NOW() - (%s || ' days')::INTERVAL
+                        GROUP BY 1
+                        ORDER BY 1 ASC
+                        """,
+                        (full_name, str(days)),
+                    )
+                    rows = cur.fetchall()
         except Exception as e:
             log.error(f"TimescaleDB query failed: {e}")
             raise HTTPException(status_code=500, detail="Query failed")

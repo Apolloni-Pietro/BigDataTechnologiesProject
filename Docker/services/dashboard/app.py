@@ -133,9 +133,12 @@ def fetch_current_metrics(owner: str, name: str) -> dict:
     except Exception as e:
         return {"error": str(e)}
 
+_FETCH_HISTORY_ERROR: dict = {}
+
 @st.cache_data(ttl=30)
 def fetch_history(owner: str, name: str, days: int) -> pd.DataFrame:
     """Chiama l'endpoint GET /repos/{owner}/{name}/history di FastAPI (che legge da TimescaleDB/Redis)"""
+    _FETCH_HISTORY_ERROR.clear()
     try:
         resp = requests.get(f"{API_URL}/repos/{owner}/{name}/history", params={"days": days}, timeout=5)
         resp.raise_for_status()
@@ -150,8 +153,12 @@ def fetch_history(owner: str, name: str, days: int) -> pd.DataFrame:
         elif "day" in df.columns:
             df["time"] = pd.to_datetime(df["day"])
             df = df.rename(columns={"health_score_avg": "health_score"})
+        else:
+            _FETCH_HISTORY_ERROR["msg"] = f"Unexpected API response format: {list(df.columns)}"
+            return pd.DataFrame()
         return df[["time", "health_score"]].set_index("time")
     except Exception as e:
+        _FETCH_HISTORY_ERROR["msg"] = str(e)
         return pd.DataFrame()
 
 @st.cache_data(ttl=30)
@@ -280,11 +287,14 @@ elif page == "🔎 Repository Detail":
             st.divider()
 
             st.subheader("Health Trend")
-            days = st.slider("Time window (days)", min_value=1, max_value=90, value=14)
+            days = st.slider("Time window (days)", min_value=1, max_value=90, value=7)
             df_history = fetch_history(owner, name, days)
 
             if df_history.empty:
-                st.info("No historical data available for this time window yet.")
+                if _FETCH_HISTORY_ERROR.get("msg"):
+                    st.warning(f"Could not load history: {_FETCH_HISTORY_ERROR['msg']}")
+                else:
+                    st.info("No historical data available for this time window yet.")
             else:
                 df_history.reset_index(inplace=True)
                 fig_line = px.line(df_history, x="time", y="health_score",
