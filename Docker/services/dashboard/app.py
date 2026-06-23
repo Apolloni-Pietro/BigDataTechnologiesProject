@@ -45,10 +45,21 @@ def fmt_metric(key: str, value) -> str:
     """Format a single metric value for display ('—' when missing)."""
     if value is None or value == "" or value == "—":
         return "—"
+    if key == "last_updated":
+        try:
+            # Case A: If value is a numeric epoch time (or string representing one)
+            epoch = float(value)
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch))
+        except (TypeError, ValueError):
+            # Case B: If value is an ISO 8601 string (e.g., "2026-06-23T15:30:00")
+            try:
+                return pd.to_datetime(value).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                return str(value)  # Fallback to raw string if parsing fails
     try:
         v = float(value)
     except (TypeError, ValueError):
-        return str(value)  # non-numeric (e.g. repo_name, last_updated)
+        return str(value)  # non-numeric (e.g. repo_name)
     if key in PERCENT_METRICS:
         return f"{v * 100:.1f}%"
     if key in INTEGER_METRICS:
@@ -56,14 +67,30 @@ def fmt_metric(key: str, value) -> str:
     return f"{v:.2f}"  # remaining floats (commit_freq_30d, pr_latency_p50)
 
 
+def _parse_last_updated(value) -> str:
+    """Convert an epoch float or ISO string to a human-friendly timestamp."""
+    if value is None or value == "" or value != value:  # None / NaN
+        return "—"
+    try:
+        return time.strftime("%-d %b %Y %H:%M", time.localtime(float(value)))
+    except (TypeError, ValueError):
+        pass
+    try:
+        return pd.to_datetime(value).strftime("%-d %b %Y %H:%M")
+    except Exception:
+        return str(value)
+
+
 def friendly_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Scale percent metrics to 0–100 and rename columns to friendly labels.
+    """Scale percent metrics to 0–100, humanise last_updated, rename columns.
 
     Returns a display-only copy; the caller's raw df is left untouched.
     """
     out = df.copy()
     for col in PERCENT_METRICS & set(out.columns):
         out[col] = pd.to_numeric(out[col], errors="coerce") * 100
+    if "last_updated" in out.columns:
+        out["last_updated"] = out["last_updated"].apply(_parse_last_updated)
     return out.rename(columns=METRIC_LABELS)
 
 # ── Page setup ────────────────────────────────────────────────────────────
@@ -131,7 +158,7 @@ def fetch_history(owner: str, name: str, days: int) -> pd.DataFrame:
 def fetch_at_risk(threshold: float = 0.35) -> pd.DataFrame:
     """Chiama l'endpoint GET /at-risk di FastAPI"""
     try:
-        resp = requests.get(f"{API_URL}/at-risk", params={"threshold": threshold, "limit": 50}, timeout=5)
+        resp = requests.get(f"{API_URL}/at-risk", params={"threshold": threshold, "limit": 500}, timeout=5)
         resp.raise_for_status()
         data = resp.json()
         return pd.DataFrame(data.get("repos", []))
@@ -185,13 +212,21 @@ if page == "📊 Overview":
     # Friendly column names; percent metrics are scaled to 0–100 by friendly_df,
     # so the colour thresholds below are on that same percentage scale.
     df_display = friendly_df(df)
-    pct_fmt = {
-        METRIC_LABELS[k]: "{:.1f}%"
-        for k in PERCENT_METRICS
-        if METRIC_LABELS[k] in df_display.columns
-    }
+    col_fmt: dict[str, str] = {}
+    for k in PERCENT_METRICS:
+        lbl = METRIC_LABELS[k]
+        if lbl in df_display.columns:
+            col_fmt[lbl] = "{:.1f}%"
+    for k in INTEGER_METRICS:
+        lbl = METRIC_LABELS[k]
+        if lbl in df_display.columns:
+            col_fmt[lbl] = "{:.0f}"
+    for k in ("commit_freq_30d", "pr_latency_p50"):
+        lbl = METRIC_LABELS[k]
+        if lbl in df_display.columns:
+            col_fmt[lbl] = "{:.2f}"
     health_col = METRIC_LABELS["health_score"]
-    styler = cast(Any, df_display.style).format(pct_fmt)
+    styler = cast(Any, df_display.style).format(col_fmt, na_rep="—")
     if health_col in df_display.columns:
         def colour_score(val):
             try:
@@ -291,12 +326,20 @@ elif page == "⚠️ At-Risk Projects":
         st.plotly_chart(fig_bar, use_container_width=True)
 
         df_risk_display = friendly_df(df_risk)
-        pct_fmt = {
-            METRIC_LABELS[k]: "{:.1f}%"
-            for k in PERCENT_METRICS
-            if METRIC_LABELS[k] in df_risk_display.columns
-        }
+        risk_col_fmt: dict[str, str] = {}
+        for k in PERCENT_METRICS:
+            lbl = METRIC_LABELS[k]
+            if lbl in df_risk_display.columns:
+                risk_col_fmt[lbl] = "{:.1f}%"
+        for k in INTEGER_METRICS:
+            lbl = METRIC_LABELS[k]
+            if lbl in df_risk_display.columns:
+                risk_col_fmt[lbl] = "{:.0f}"
+        for k in ("commit_freq_30d", "pr_latency_p50"):
+            lbl = METRIC_LABELS[k]
+            if lbl in df_risk_display.columns:
+                risk_col_fmt[lbl] = "{:.2f}"
         st.dataframe(
-            cast(Any, df_risk_display.style).format(pct_fmt),
+            cast(Any, df_risk_display.style).format(risk_col_fmt, na_rep="—"),
             use_container_width=True,
         )
