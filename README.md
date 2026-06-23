@@ -8,8 +8,8 @@ maintenance gaps), attaches an unsupervised **ML risk score**, and serves the re
 through a REST API and a live dashboard.
 
 All data is **real** — there is no synthetic/streaming demo path. GH Archive is an
-hourly batch product, so an in-container scheduler drives the pipeline (no message
-broker).
+hourly batch product, so an in-container scheduler drives the pipeline. An MQTT broker
+(Mosquitto) is included for real-time health-score alerts — see [MQTT alerts](#mqtt-alerts).
 
 ## Two ways to use it
 
@@ -154,6 +154,93 @@ python3 GHArchiveDownload.py     # edit START_DATE / END_DATE near the top first
 It creates `raw_json/` (raw `.json.gz`, emptied as each month finishes) and
 `processed_parquet/` (the kept output, which the platform's `BACKFILL_PARQUET_DIR`
 path can ingest directly).
+
+---
+
+## MQTT alerts
+
+After each gold cycle the pipeline publishes an alert to the Mosquitto broker whenever a
+repo's `health_score` **drops below a configurable threshold** for the first time.
+Alerts are **edge-triggered**: they fire once when the score crosses the threshold, not
+on every subsequent cycle where it stays low.
+
+### Topic structure
+
+```
+repos/{owner}/{repo}/alerts
+```
+
+### Alert payload (JSON)
+
+```json
+{
+  "repo": "owner/repo",
+  "health_score": 0.31,
+  "previous_health_score": 0.76,
+  "threshold": 0.4,
+  "ts": 1782228400
+}
+```
+
+`previous_health_score` is `null` the first time a repo is scored (no prior data in
+Redis). On all subsequent cycles it reflects the score from the previous gold run.
+
+### Ports
+
+| Port   | Protocol           |
+| ------ | ------------------ |
+| `1883` | MQTT (TCP)         |
+| `9883` | MQTT over WebSockets |
+
+Both are exposed on `localhost` when the stack is running.
+
+### Configuration
+
+Set in `Docker/.env`:
+
+```dotenv
+MQTT_ALERT_THRESHOLD=0.4   # alert when health_score drops below this (0.0–1.0)
+```
+
+### Subscribing to alerts
+
+Any MQTT client works. With `mosquitto_sub`:
+
+```bash
+# All repos
+mosquitto_sub -h localhost -p 1883 -t "repos/#" -v
+
+# Single repo
+mosquitto_sub -h localhost -p 1883 -t "repos/owner/repo/alerts" -v
+```
+
+### Live demo
+
+A demo script injects a fake health-score drop and fires a real MQTT alert without
+waiting for the next hourly gold cycle.
+
+Open two terminals:
+
+```bash
+# Terminal 1 — subscribe
+mosquitto_sub -h localhost -p 1883 -t "repos/#" -v
+
+# Terminal 2 — fire a default alert (demo-org/demo-repo, score 0.85 → 0.25)
+docker compose exec pipeline python demo_alert.py
+
+# Custom repo and scores
+docker compose exec pipeline python demo_alert.py \
+  --repo torvalds/linux --score 0.31 --prev 0.76
+```
+
+Terminal 1 will immediately print:
+
+```
+repos/demo-org/demo-repo/alerts {"repo": "demo-org/demo-repo", "health_score": 0.25, "previous_health_score": 0.85, "threshold": 0.4, "ts": ...}
+```
+
+The script seeds Redis with the "previous" score, publishes the alert, then removes the
+fake key — no side-effects on the running pipeline.
 
 ---
 
