@@ -3,49 +3,23 @@ services:
   # INFRASTRUCTURE
   # ────────────────────────────────────────────────
 
-  redpanda:
-    image: docker.redpanda.com/redpandadata/redpanda:latest
-    container_name: oss-redpanda
-    command:
-      - redpanda
-      - start
-      - --mode dev-container
-      # dev-container disables performance checks that would
-      # otherwise require tuning the host OS. Fine for local use.
-      - --overprovisioned
-      # overprovisioned tells Redpanda not to complain about
-      # sharing CPU with other Docker containers.
-      - --smp 1
-      # smp = number of CPU cores Redpanda uses.
-      # 1 is enough for development.
-      - --memory 512M
-      - --reserve-memory 0M
-      - --node-id 0
-      - --kafka-addr PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
-      # Two listeners:
-      #   PLAINTEXT://  → used by containers INSIDE Docker network
-      #   OUTSIDE://    → used by tools on your HOST machine
-      - --advertise-kafka-addr PLAINTEXT://redpanda:29092,OUTSIDE://localhost:9092
-      # This tells clients which address to actually connect to.
-      # Containers use the Docker DNS name "redpanda" on port 29092.
-      # Your host machine uses localhost:9092.
-      - --check=false
+  # MinIO is the BRONZE + SILVER backend: an S3-compatible object store.
+  # Raw GH Archive files and cleaned Parquet live here. See MEDALLION.md §3.
+  minio:
+    image: minio/minio:latest
+    container_name: oss-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
     ports:
-      - "9092:9092" # Kafka protocol — accessible from your laptop
-      - "9644:9644" # Admin API + Redpanda Console web UI
+      - "9000:9000" # S3 API
+      - "9001:9001" # MinIO web console
     volumes:
-      - redpanda-data:/var/lib/redpanda/data
-    healthcheck:
-      # Docker will only mark this container healthy when this
-      # command succeeds. Other services wait for this before starting.
-      test: ["CMD-SHELL", "rpk cluster info --brokers localhost:9092 || exit 1"]
-      interval: 10s
-      timeout: 8s
-      retries: 10
-      start_period: 20s
-      # start_period gives Redpanda 20s to boot before health
-      # checks begin. Without this it fails on the first check
-      # and Docker marks it unhealthy before it has even started.
+      - minio-data:/data
+    # No Docker healthcheck here: the minio/minio server image is minimal and
+    # does not reliably ship `mc`/`curl`. The pipeline service has its own
+    # wait_for_minio() retry loop instead, so it depends on `service_started`.
 
   timescaledb:
     image: timescale/timescaledb:latest-pg16
@@ -103,58 +77,53 @@ services:
       retries: 10
 
   # ────────────────────────────────────────────────
-  # WORKERS
+  # PIPELINE (the ingestion path)
   # ────────────────────────────────────────────────
 
-  ingestion-worker:
+  # The medallion pipeline: the ingestion path. Hourly bronze->silver->
+  # gold over GH Archive, ML risk scoring.
+  pipeline:
     build:
-      context: ./services/ingestion
-      # context is the directory Docker uses as the build root.
-      # The Dockerfile at ./services/ingestion/Dockerfile will be used.
-    container_name: oss-ingestion
+      context: ./services/pipeline
+    container_name: oss-pipeline
     environment:
-      REDPANDA_BROKERS: redpanda:29092
-      # Note: this is the INTERNAL address (port 29092, not 9092).
-      # Containers talk to each other via the Docker internal network
-      # using the service name as the hostname. "redpanda" resolves to
-      # the Redpanda container's internal IP automatically.
-      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
-      INGESTION_START_DATE: ${INGESTION_START_DATE:-2024-01-01}
-    depends_on:
-      redpanda:
-        condition: service_healthy
-      # This container will not start until Redpanda passes its healthcheck.
-      # Without this, the Python Kafka producer would crash on startup
-      # because the broker is not yet ready to accept connections.
-    volumes:
-      - ./data/parquet:/app/data/parquet
-      # Bind mount: ./data/parquet on your HOST maps to /app/data/parquet
-      # INSIDE the container. Files written here persist on your machine.
-    restart: on-failure
-    # on-failure: restart if the process exits with a non-zero code
-    # (i.e. crashed), but do NOT restart if it exits cleanly with code 0.
-
-  consumer-worker:
-    build:
-      context: ./services/consumer
-    container_name: oss-consumer
-    environment:
-      REDPANDA_BROKERS: redpanda:29092
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_SECURE: "false"
       POSTGRES_DSN: postgresql://${POSTGRES_USER:-oss}:${POSTGRES_PASSWORD:-changeme}@timescaledb:5432/${POSTGRES_DB:-oss_health}
-      # Again: "timescaledb" is the Docker DNS hostname for that container.
       REDIS_URL: redis://redis:6379
-      # "redis" is the Docker DNS hostname for the Redis container.
-      FLUSH_EVERY: "50"
+      # Optional one-shot historical replay on startup (format YYYY-MM-DD-H).
+      BACKFILL_START: ${BACKFILL_START:-}
+      BACKFILL_END: ${BACKFILL_END:-}
+      # Optional parquet backfill: set to /backfill to ingest the pre-downloaded
+      # monthly Parquet files mounted below. Takes precedence over BACKFILL_START/END.
+      # See PARQUET_BACKFILL.md.
+      BACKFILL_PARQUET_DIR: ${BACKFILL_PARQUET_DIR:-}
+      DUCKDB_MEMORY_LIMIT: ${DUCKDB_MEMORY_LIMIT:-8GB}
+      # Replay: shift the pipeline's "now" back N years (0 = off). See clock.py.
+      REPLAY_OFFSET_YEARS: ${REPLAY_OFFSET_YEARS:-0}
+      # Rolling-window sizes (widen for a replay of an older single month).
+      CONTRIBUTOR_WINDOW_DAYS: ${CONTRIBUTOR_WINDOW_DAYS:-90}
+      COMMIT_FREQ_WINDOW_DAYS: ${COMMIT_FREQ_WINDOW_DAYS:-30}
+      # Filename glob for the parquet backfill (restrict to specific months).
+      BACKFILL_PARQUET_GLOB: ${BACKFILL_PARQUET_GLOB:-gh_events_*.parquet}
+      # Retention: prune aged MinIO objects so 24/7 operation doesn't fill disk.
+      BRONZE_RETENTION_DAYS: ${BRONZE_RETENTION_DAYS:-30}
+      SILVER_RETENTION_DAYS: ${SILVER_RETENTION_DAYS:-120}
+      RETENTION_CRON_HOUR: ${RETENTION_CRON_HOUR:-4}
+    volumes:
+      # Pre-downloaded monthly Parquet files (repo-root GHArchiveDownload.py output)
+      # for the parquet backfill. Read-only; harmless when BACKFILL_PARQUET_DIR is unset.
+      - ../processed_parquet:/backfill:ro
     depends_on:
-      redpanda:
-        condition: service_healthy
+      minio:
+        condition: service_started
       timescaledb:
         condition: service_healthy
       redis:
         condition: service_healthy
     restart: unless-stopped
-    # unless-stopped: always restart on crash, EXCEPT if you explicitly
-    # ran `docker compose stop` or `docker compose down`.
 
   # ────────────────────────────────────────────────
   # SERVING
@@ -202,9 +171,9 @@ services:
 # ────────────────────────────────────────────────
 
 volumes:
-  redpanda-data:
   timescale-data:
   redis-data:
+  minio-data:
   # These are managed by Docker. Data persists across `docker compose down`
   # but is deleted by `docker compose down -v`.
   # Unlike bind mounts, you cannot browse them directly in Finder/Explorer.

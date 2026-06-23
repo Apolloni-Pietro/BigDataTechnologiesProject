@@ -1,16 +1,24 @@
-# Big Data Technologies Course - OSS Health Monitor Project
+# OSS Health Monitor — Docker / container reference
 
-Docker implementation for the entire project.
+The container and operations reference for the platform. This is the "what runs
+and how to operate it" companion to:
+
+- [`MEDALLION.md`](./MEDALLION.md) — the architecture and the reasoning behind it.
+- [`services/pipeline/README.md`](./services/pipeline/README.md) — the bronze →
+  silver → gold pipeline internals (run, configure, backfill, extend).
 
 ---
 
 ## Table of Contents
 
+- [How it works](#how-it-works)
 - [Architecture](#architecture)
+- [Storage layers](#storage-layers)
 - [Prerequisites](#prerequisites)
 - [Quick Start](#quick-start)
 - [Environment Variables](#environment-variables)
 - [Services](#services)
+- [Scheduled jobs](#scheduled-jobs)
 - [Common Operations](#common-operations)
 - [Accessing the UIs](#accessing-the-uis)
 - [Data Flow](#data-flow)
@@ -21,396 +29,302 @@ Docker implementation for the entire project.
 
 ## How it works
 
-The platform ingests public GitHub events from [GH Archive](https://www.gharchive.org/) (a free archive of every public GitHub event since 2011) and supplements this with live data from the GitHub REST API. Events flow through a message broker (Redpanda) into a consumer that computes health metrics and stores them in two complementary databases: Redis for real-time access, and TimescaleDB for long-term historical analysis.
+The platform is a **batch medallion lakehouse**. Once an hour, the `pipeline`
+container downloads the latest [GH Archive](https://www.gharchive.org/) hourly file
+(every public GitHub event since 2011) and runs it through three quality tiers —
+**bronze** (raw), **silver** (cleaned), **gold** (business-ready metrics + an ML
+risk score). A FastAPI layer serves the gold tier; a Streamlit dashboard reads the
+API.
 
-A FastAPI layer sits in front of both databases and exposes a unified REST API. A Streamlit dashboard reads from that API to present live charts, trend analysis, and risk alerts.
+GH Archive is a batch product (one `.json.gz` per hour), so there is **no message
+broker** — an in-container scheduler drives the pipeline. There is no synthetic
+data and no streaming path; every number comes from real GitHub events.
 
 ---
 
 ## Architecture
 
 ```
-┌───────────────────────────────────────────────────────────────────────┐
-│                        Docker Compose Network                         │
-│                                                                       │
-│  ── Infrastructure ──────────────────────────────────────────────── │
-│                                                                       │
-│  ┌─────────────────┐  ┌──────────────────┐  ┌───────────────────┐   │
-│  │    Redpanda      │  │   TimescaleDB    │  │   Redis Stack     │   │
-│  │  Kafka-compat    │  │  PostgreSQL +    │  │  TimeSeries +     │   │
-│  │  broker          │  │  time-series     │  │  pub/sub          │   │
-│  │  :9092  :9644    │  │  :5432           │  │  :6379  :8001     │   │
-│  └─────────────────┘  └──────────────────┘  └───────────────────┘   │
-│         ▲  │                  ▲                       ▲              │
-│         │  │                  │                       │              │
-│  ── Workers ────────────────────────────────────────────────────── │
-│         │  │                  │                       │              │
-│  ┌──────┴──┴───────────┐  ┌───┴───────────────────────┴──────────┐  │
-│  │   Ingestion Worker   │  │          Consumer Worker             │  │
-│  │  GH Archive + API    │  │  Redpanda → metrics → dual-write     │  │
-│  │  → Redpanda producer │  │  to Redis (hot) + TimescaleDB (cold) │  │
-│  └─────────────────────┘  └──────────────────────────────────────┘  │
-│                                        │                             │
-│  ── Serving ────────────────────────── │ ──────────────────────── │
-│                                        ▼                             │
-│  ┌─────────────────────────────────────────────────────────────────┐ │
-│  │                          FastAPI  :8080                          │ │
-│  │              REST API — routes queries to Redis or TimescaleDB   │ │
-│  └──────────────────────────────┬──────────────────────────────────┘ │
-│                                 │                                    │
-│  ┌──────────────────────────────▼──────────────────────────────────┐ │
-│  │                      Streamlit  :8501                            │ │
-│  │              Dashboard — health charts, trend analysis           │ │
-│  └─────────────────────────────────────────────────────────────────┘ │
-│                                                                       │
-│  Named volumes: redpanda-data  timescale-data  redis-data            │
-│  Bind mount:    ./data/parquet  (Parquet files persist on host)      │
-└───────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────-─┐
+│                          Docker Compose Network                           │
+│                                                                           │
+│  ── Object Storage ────────────────────────────────────────────────────   │
+│  ┌──────────────────────────────────────────────────────────────────────┐ │
+│  │ MinIO (S3-compatible)             :9000 (S3)    :9001 (Console)      │ │
+│  │  bronze/ raw .json.gz       silver/ typed Parquet    gold/ models    │ │
+│  └──────────────────────────────────────────────────────────────────────┘ │
+│            ▲ write            ▲ read/write           ▲ read               │
+│  ── Orchestrator ─────────────┼──────────────────────┼─────────────────   │
+│  ┌────────────────────────────┴──────────────────────┴──────────────────┐ │
+│  │ pipeline (APScheduler)                                               │ │
+│  │  hourly: bronze → silver → gold              daily: retention        │ │
+│  └───────────────────────────────┬───────────────────┬──────────────────┘ │
+│                                  │ write gold        │ write gold         │
+│  ── Serving Stores ──────────────▼───────────────────▼─────────────────   │
+│  ┌──────────────────────────┐        ┌──────────────────────────────────┐ │
+│  │ TimescaleDB :5432        │        │ Redis Stack :6379  :8001         │ │
+│  │ metric history (2y)      │        │ latest values + 7-day trends     │ │
+│  └─────────────┬────────────┘        └────────────────┬─────────────────┘ │
+│                └─────────────────┬────────────────────┘                   │
+│  ── Serving ─────────────────────▼─────────────────────────────────────   │
+│  ┌──────────────────────────────────────────────────────────────────────┐ │
+│  │ api (FastAPI) :8080 ──► routes queries to Redis (≤7d) or TimescaleDB │ │
+│  └──────────────────────────────────┬───────────────────────────────────┘ │
+│                                     │ calls API only                      │
+│  ┌──────────────────────────────────▼───────────────────────────────────┐ │
+│  │ dashboard (Streamlit) :8501                                          │ │
+│  └──────────────────────────────────────────────────────────────────────┘ │
+│                                                                           │
+│  Named volumes: minio-data  timescale-data  redis-data                    │
+└──────────────────────────────────────────────────────────────────────────-┘
 ```
 
-### Storage tiers
+Six containers. Three run from **prebuilt public images** (`minio`, `timescaledb`,
+`redis`); three are **built from Dockerfiles** (`pipeline`, `api`, `dashboard`).
 
-The platform uses a **hot/cold** two-tier storage strategy.
+---
 
-| Tier | Store                    | Retention | Latency | Purpose                                                  |
-| ---- | ------------------------ | --------- | ------- | -------------------------------------------------------- |
-| Hot  | Redis Stack (TimeSeries) | 7 days    | < 1 ms  | Live dashboard, real-time alerting, current scores       |
-| Cold | TimescaleDB              | 2 years   | 5–50 ms | Historical trends, ML feature computation, SQL analytics |
+## Storage layers
 
-Every metric is written to **both** stores simultaneously by the consumer worker. The FastAPI layer automatically routes queries to the appropriate tier based on the requested time window: ≤ 7 days goes to Redis, anything longer goes to TimescaleDB.
+| Layer  | Backend                  | Holds                                              | Retention                     |
+| ------ | ------------------------ | -------------------------------------------------- | ----------------------------- |
+| Bronze | MinIO (object)           | raw, immutable GH Archive `.json.gz`               | `BRONZE_RETENTION_DAYS` (30)  |
+| Silver | MinIO (Parquet) + DuckDB | cleaned, typed, deduplicated event table           | `SILVER_RETENTION_DAYS` (120) |
+| Gold   | TimescaleDB + Redis      | per-repo metrics, ML risk score, served to the API | TimescaleDB 2y / Redis 7d     |
+
+Gold is bounded by TimescaleDB's retention policy and Redis's LRU + 7-day series.
+MinIO is the only store that would otherwise grow forever, so the `pipeline`'s
+daily **retention job** prunes aged bronze/silver objects (see
+[Scheduled jobs](#scheduled-jobs)).
 
 ---
 
 ## Prerequisites
 
 - **Docker** ≥ 24.0 — [Install Docker](https://docs.docker.com/get-docker/)
-- **Docker Compose** ≥ 2.20 (included in Docker Desktop; verify with `docker compose version`)
-- **Git**
-- **A GitHub personal access token** — needed by the ingestion worker to call the GitHub REST API without hitting the 60 req/hr unauthenticated rate limit. A token bumps this to 5,000 req/hr.
-  - Generate one at: GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)
-  - Required scopes: `public_repo` (read-only access to public repositories)
-- **Disk space**: at least 20 GB free for a first run (Parquet data, Docker images, database volumes)
-- **RAM**: at least 6 GB available to Docker (8 GB recommended)
+- **Docker Compose** ≥ 2.20 (bundled with Docker Desktop; verify `docker compose version`)
+- **RAM**: ≥ 6 GB available to Docker (8 GB recommended)
+- **Disk**: ≥ 20 GB free for a first run; more for long backfills (each GH Archive
+  month is ~15–25 GB of bronze before retention prunes it)
+- **No API tokens needed** — GH Archive is public and the pipeline downloads it directly.
 
 ---
 
 ## Quick Start
 
-Five steps from a fresh clone to a running platform.
-
-**1. Clone the repository**
+**1. Configure**
 
 ```bash
-git clone https://github.com/your-org/oss-health-monitor.git
-cd oss-health-monitor
+cd Docker
+cp .env.example .env        # defaults work out of the box; edit if you like
 ```
 
-**2. Create your environment file**
-
-```bash
-cp .env.example .env
-```
-
-Open `.env` and fill in your GitHub token (the only required change):
-
-```bash
-GITHUB_TOKEN=ghp_your_token_here
-```
-
-**3. Create the local data directory**
-
-```bash
-mkdir -p data/parquet
-```
-
-**4. Build images and start all containers**
+**2. Build and start**
 
 ```bash
 docker compose up --build -d
 ```
 
-The first build downloads base images and installs Python dependencies. This takes 3–5 minutes. Subsequent starts take a few seconds.
+First build takes 3–5 minutes (base images + Python deps). The `pipeline` runs one
+cycle immediately, then on schedule.
 
-**5. Verify everything is healthy**
+**3. Verify**
 
 ```bash
 docker compose ps
 ```
 
-All containers should show `healthy` or `running`. If any show `starting`, wait 30 seconds and run the command again — TimescaleDB needs a moment to initialise its schema on the first boot.
+All containers should be `running`/`healthy`. TimescaleDB needs ~20–30 s to
+initialise its schema on first boot; dependents wait for it automatically.
 
-You should now be able to open:
+> GH Archive publishes each hour's file on a ~1–2 h delay, so the very first live
+> cycle processes an hour from a couple of hours ago. To populate history
+> immediately, use a [backfill](#scheduled-jobs).
 
-| Interface           | URL                        | What it is                                               |
-| ------------------- | -------------------------- | -------------------------------------------------------- |
-| Streamlit dashboard | http://localhost:8501      | Main user-facing dashboard                               |
-| FastAPI docs        | http://localhost:8080/docs | Interactive REST API explorer                            |
-| Redpanda Console    | http://localhost:9644      | Browse topics, inspect events, monitor consumer lag      |
-| RedisInsight        | http://localhost:8001      | Browse Redis keys, run commands, inspect TimeSeries data |
+Then open:
+
+| Interface           | URL                          | What it is                            |
+| ------------------- | ---------------------------- | ------------------------------------- |
+| Streamlit dashboard | `http://localhost:8501`      | main user-facing dashboard            |
+| FastAPI docs        | `http://localhost:8080/docs` | interactive REST API explorer         |
+| MinIO console       | `http://localhost:9001`      | browse bronze/silver/gold objects     |
+| RedisInsight        | `http://localhost:8001`      | browse Redis keys and TimeSeries data |
 
 ---
 
 ## Environment Variables
 
-Copy `.env.example` to `.env` and edit the values. Never commit `.env` to version control — it is listed in `.gitignore`.
+Copy `.env.example` to `.env` and edit. Never commit `.env` — it is in `.gitignore`.
 
-| Variable               | Required | Default      | Description                                                                                                                     |
-| ---------------------- | -------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------- |
-| `GITHUB_TOKEN`         | **Yes**  | —            | GitHub personal access token. Increases API rate limit from 60 to 5,000 req/hr.                                                 |
-| `INGESTION_START_DATE` | No       | `2023-01-01` | Earliest date to backfill from GH Archive. Format: `YYYY-MM-DD`. Use a recent date to keep the initial data volume manageable.  |
-| `POSTGRES_USER`        | No       | `oss`        | TimescaleDB username.                                                                                                           |
-| `POSTGRES_PASSWORD`    | No       | `changeme`   | TimescaleDB password. Change this if the port is exposed to a network.                                                          |
-| `POSTGRES_DB`          | No       | `oss_health` | TimescaleDB database name.                                                                                                      |
-| `REDIS_MAX_MEMORY`     | No       | `2gb`        | Maximum RAM Redis may use before evicting old keys (LRU policy). Reduce if your machine has less than 8 GB available to Docker. |
-
-**`.env.example`**
-
-```dotenv
-# Required
-GITHUB_TOKEN=
-
-# Ingestion
-INGESTION_START_DATE=2023-01-01
-
-# TimescaleDB
-POSTGRES_USER=oss
-POSTGRES_PASSWORD=changeme
-POSTGRES_DB=oss_health
-
-# Redis
-REDIS_MAX_MEMORY=2gb
-```
+| Variable                | Default      | Description                                                                                                     |
+| ----------------------- | ------------ | --------------------------------------------------------------------------------------------------------------- |
+| `MINIO_ACCESS_KEY`      | `minioadmin` | MinIO root user / S3 access key.                                                                                |
+| `MINIO_SECRET_KEY`      | `minioadmin` | MinIO root password / S3 secret key. Change if exposed to a network.                                            |
+| `BACKFILL_START`        | —            | Optional one-shot replay start, format `YYYY-MM-DD-H`. Empty = process new hours only.                          |
+| `BACKFILL_END`          | —            | Optional one-shot replay end, format `YYYY-MM-DD-H`.                                                            |
+| `BACKFILL_PARQUET_DIR`  | —            | Set to `/backfill` to ingest pre-downloaded monthly Parquet (precedence over `BACKFILL_START/END`). See `PARQUET_BACKFILL.md`. |
+| `REPLAY_OFFSET_YEARS`   | `0`          | Shift the pipeline's "now" back N years (process the feed from N years ago). `0` = off. See `services/pipeline/clock.py`. |
+| `CONTRIBUTOR_WINDOW_DAYS` / `COMMIT_FREQ_WINDOW_DAYS` | `90` / `30` | Gold rolling-window sizes. Widen for a replay of an older single month. |
+| `BRONZE_RETENTION_DAYS` | `30`         | Delete bronze objects older than this. Bronze is a transient raw landing zone.                                  |
+| `SILVER_RETENTION_DAYS` | `120`        | Delete silver objects older than this. **Must stay ≥ `CONTRIBUTOR_WINDOW_DAYS`** or metrics degrade.            |
+| `RETENTION_CRON_HOUR`   | `4`          | UTC hour for the daily retention sweep (runs at `:45`).                                                         |
+| `POSTGRES_USER`         | `oss`        | TimescaleDB username.                                                                                           |
+| `POSTGRES_PASSWORD`     | `changeme`   | TimescaleDB password. Change if the port is exposed.                                                            |
+| `POSTGRES_DB`           | `oss_health` | TimescaleDB database name.                                                                                      |
+| `REDIS_MAX_MEMORY`      | `2gb`        | Redis memory cap before LRU eviction. Reduce to `1gb` on < 8 GB machines.                                       |
 
 ---
 
 ## Services
 
-### Redpanda
+### MinIO
 
-Redpanda is a Kafka-compatible message broker that acts as the central nervous system of the platform. Every GitHub event enters the system here. The ingestion worker appends events as they arrive; the consumer worker reads from its current offset at its own pace. If the consumer crashes, it resumes from exactly where it left off — no events are lost or duplicated.
+S3-compatible object store; the **bronze + silver** backend, plus `gold/models/`
+for the trained ML model. Buckets (`bronze`, `silver`, `gold`) are created
+automatically by the pipeline on startup.
 
-**Topics created on startup:**
+**Ports:** `9000` (S3 API), `9001` (web console; log in with `MINIO_ACCESS_KEY` /
+`MINIO_SECRET_KEY`).
 
-| Topic                 | Partitions | Retention | Key         | Purpose                                  |
-| --------------------- | ---------- | --------- | ----------- | ---------------------------------------- |
-| `gh-events`           | 6          | 7 days    | `repo_name` | Raw GitHub events                        |
-| `repo-health-metrics` | 6          | 30 days   | `repo_name` | Computed metric snapshots                |
-| `repo-latest-state`   | 6          | Compacted | `repo_name` | Latest metadata per repo (log-compacted) |
-| `health-alerts`       | 3          | 90 days   | `repo_name` | Health score drop notifications          |
+### pipeline
 
-Partitioning by `repo_name` ensures all events for a given repository land in the same partition, preserving per-repo ordering.
-
-**Ports:** `9092` (Kafka protocol), `9644` (Admin API + Redpanda Console UI)
-
----
+The orchestrator (built from `services/pipeline`). Runs an APScheduler that drives
+the whole medallion DAG — download, clean, aggregate, score, enrich, prune. It has
+no exposed port. See [Scheduled jobs](#scheduled-jobs) and the
+[pipeline README](./services/pipeline/README.md).
 
 ### TimescaleDB
 
-TimescaleDB is PostgreSQL with a time-series extension. It stores all computed health metrics going back up to 2 years. Data is automatically organised into time-based chunks on disk, which makes range queries (e.g., "last 90 days for 10,000 repos") fast without manual indexing work.
+PostgreSQL + time-series extension; the **gold history** store. The schema is
+created automatically on first boot from `./init/timescale/01_schema.sql` and
+`02_medallion.sql`. Key objects:
 
-Key features enabled in the schema:
+- **`repo_health_metrics`** hypertable — one row per repo per pipeline run
+  (`active_actors`, `event_count`, `commit_freq_30d`, `active_contributors_90d`,
+  `bus_factor`, `pr_latency_p50`, `pr_abandon_rate`, `stale_issue_ratio`,
+  `days_since_last_commit`, `days_since_last_release`, `risk_score`, `health_score`).
+- **`repo_health_daily`** continuous aggregate — daily rollup, refreshed hourly.
+- Compression after 7 days; retention drops data older than 2 years.
 
-- **Hypertable** on `repo_health_metrics` — automatic time-based chunk management
-- **Compression policy** — metrics older than 7 days are compressed (typically 90%+ reduction)
-- **Retention policy** — data older than 2 years is automatically dropped
-- **Continuous aggregate** `repo_health_daily` — a materialised daily rollup that updates incrementally every hour
-
-The schema is initialised automatically from `./init/timescale/01_schema.sql` the first time the container starts with an empty volume.
-
-**Port:** `5432`
-
----
+**Port:** `5432`.
 
 ### Redis Stack
 
-Redis Stack extends standard Redis with several modules. This project uses **RedisTimeSeries** for storing recent metric history and **pub/sub** for real-time alerting.
+The **gold hot tier** (RedisTimeSeries module). Holds `latest:{repo}` (a hash of
+current values for O(1) lookups) and `ts:{repo}:{metric}` (7-day series for trend
+charts). Memory-capped with LRU eviction — safe because the full history lives in
+TimescaleDB.
 
-RedisTimeSeries stores the last 7 days of every metric for every tracked repository. Each metric lives in a key formatted as `ts:{repo_name}:{metric_name}`. A plain Redis hash at `latest:{repo_name}` holds only the most recent values for each metric, making current-value lookups O(1).
+**Ports:** `6379` (Redis), `8001` (RedisInsight UI).
 
-When the consumer detects a health score drop, it publishes to the `alerts` Redis channel. Any subscriber (alerting service, Slack notifier, webhook handler) receives it immediately without polling.
+### FastAPI (`api`)
 
-The **RedisInsight** web interface is available at port `8001` for browsing keys and running commands.
+The REST layer every client talks to — never the databases directly. Routes by
+time window: recent reads come from Redis, longer ranges from TimescaleDB.
 
-**Ports:** `6379` (Redis protocol), `8001` (RedisInsight UI)
+Endpoints: `GET /health`, `GET /repos`, `GET /repos/{owner}/{name}/current`
+(Redis), `GET /repos/{owner}/{name}/history` (≤7d Redis, >7d TimescaleDB),
+`GET /at-risk`. Swagger UI at `http://localhost:8080/docs`.
 
----
+**Port:** `8080`.
 
-### Ingestion Worker
+### Streamlit (`dashboard`)
 
-A continuously running Python service responsible for one task: getting data from the internet into Redpanda.
+The user-facing UI. Calls **FastAPI exclusively** — no database credentials. All
+data access, caching, and routing live in the API.
 
-It runs two concurrent loops:
-
-- **GH Archive loop** — downloads hourly `.json.gz` event files from `gharchive.org`, parses each JSON line, and produces events to the `gh-events` Redpanda topic. Each event is keyed by repository name. After producing, each hourly file is converted to Parquet format and saved to `./data/parquet/` for long-term local storage, then the raw `.json.gz` is discarded.
-
-- **GitHub API loop** — periodically fetches repository metadata (topics, language, star count, open issue count, branch protection status) using the GitHub REST API. Uses conditional `If-Modified-Since` requests to avoid burning rate limit on unchanged repos.
-
-Rate limiting is handled with exponential backoff via the `tenacity` library. The worker respects `X-RateLimit-Remaining` headers and sleeps accordingly before each request.
-
----
-
-### Consumer Worker
-
-A continuously running Python service responsible for turning raw events into stored metrics.
-
-For each event it reads from Redpanda, it identifies the repository and updates in-memory rolling statistics: commit counters, contributor sets, PR open/close timestamps, issue response times, and release dates. Periodically it flushes these statistics as computed health metrics, writing to both Redis and TimescaleDB in a single dual-write operation.
-
-Health metrics computed per repository:
-
-| Metric                    | Description                                                                |
-| ------------------------- | -------------------------------------------------------------------------- |
-| `commit_freq_30d`         | Average daily commits over the last 30 days                                |
-| `bus_factor`              | Minimum number of contributors who collectively own > 80% of commits       |
-| `pr_latency_p50`          | Median hours from PR opened to first maintainer response                   |
-| `pr_abandon_rate`         | Fraction of PRs closed without merging                                     |
-| `stale_issue_ratio`       | Fraction of open issues with no activity in > 90 days                      |
-| `days_since_last_release` | Days elapsed since the most recent tagged release                          |
-| `outdated_dep_ratio`      | Fraction of declared dependencies > 2 major versions behind (via deps.dev) |
-| `health_score`            | Composite weighted score in [0, 1]. Values below 0.35 trigger an alert.    |
-
-When `health_score` drops below the alert threshold, the worker publishes to the Redis `alerts` channel.
+**Port:** `8501`.
 
 ---
 
-### FastAPI
+## Scheduled jobs
 
-The REST API layer that all external clients talk to. Streamlit, any future frontend, CLI tools, and webhooks all go through here — never directly to the databases.
+The `pipeline` container runs these on an in-process scheduler (UTC):
 
-FastAPI is responsible for routing queries to the correct storage tier:
+| When                  | Job              | What it does                                                                           |
+| --------------------- | ---------------- | -------------------------------------------------------------------------------------- |
+| Every hour at `:15`   | `hourly_job`     | process the latest available GH Archive hour: bronze → silver → gold                   |
+| On startup, once      | immediate run    | one `hourly_job` so a fresh stack isn't empty                                          |
+| Daily at `04:45`      | `retention_job`  | prune bronze (>`BRONZE_RETENTION_DAYS`) and silver (>`SILVER_RETENTION_DAYS`) in MinIO |
+| On startup (optional) | `backfill`       | if `BACKFILL_START`/`BACKFILL_END` are set, replay that hour range once (downloads it) |
+| On startup (optional) | parquet backfill | if `BACKFILL_PARQUET_DIR` is set, ingest pre-downloaded monthly Parquet (precedence)   |
+| On startup (optional) | replay           | if `REPLAY_OFFSET_YEARS>0`, shift "now" back N years: parquet bulk → hourly tail → live |
 
-- Requests for recent data (≤ 7 days) are served from **Redis** — sub-millisecond response.
-- Requests for historical data (> 7 days) are served from **TimescaleDB** — handles any time range.
-- Current-value lookups (`/health/current`) always hit the Redis `latest:{repo}` hash.
+**Backfill** (populate history fast): set the range in `.env`, then start the stack.
 
-Interactive API documentation (Swagger UI) is available at `http://localhost:8080/docs` while the container is running.
+```dotenv
+BACKFILL_START=2024-01-01-0
+BACKFILL_END=2024-01-01-23
+```
 
-**Port:** `8080`
+Each stage is idempotent (bronze/silver skip objects already in MinIO), so backfills
+are resumable and safe to re-run.
 
----
-
-### Streamlit Dashboard
-
-The user-facing web interface. Streamlit is a Python-native tool for building data applications — it renders sliders, charts, and tables from plain Python code, with no frontend development required.
-
-The dashboard queries **FastAPI exclusively** — it has no database credentials and no direct connection to Redis or TimescaleDB. This separation means all data access logic, caching, and routing lives in one place. If the backend changes, only FastAPI needs to be updated.
-
-**Port:** `8501`
+**Faster backfill from pre-downloaded Parquet.** If you already have monthly Parquet
+from the repo-root `GHArchiveDownload.py`, set `BACKFILL_PARQUET_DIR=/backfill` (the
+files are bind-mounted there) to re-project them straight into silver — ~6–10× faster,
+no re-download. Takes precedence over `BACKFILL_START/END`; run on a fresh silver bucket.
+Full guide: [`PARQUET_BACKFILL.md`](PARQUET_BACKFILL.md).
 
 ---
 
 ## Common Operations
 
-**Start all containers (detached)**
-
 ```bash
-docker compose up -d
+docker compose up -d              # start (detached)
+docker compose down               # stop, keep data
+docker compose down -v            # full reset — delete all volumes
+docker compose ps                 # status / health
+docker compose logs -f pipeline   # follow the pipeline (also: api, dashboard)
+docker compose up --build -d api  # rebuild one service after code changes
 ```
 
-**Stop all containers (preserves data)**
+**Run the retention sweep on demand** (instead of waiting for 04:45):
 
 ```bash
-docker compose down
+docker compose exec pipeline python -c "import retention; retention.run()"
 ```
 
-**Full reset — delete all data and start fresh**
+**Connect to TimescaleDB:**
 
 ```bash
-docker compose down -v
+docker compose exec timescaledb psql -U oss -d oss_health \
+  -c "SELECT repo_name, health_score, risk_score FROM repo_health_metrics ORDER BY time DESC LIMIT 10;"
 ```
 
-**View logs for a specific service**
+**Inspect a Redis series:**
 
 ```bash
-docker compose logs -f consumer-worker
-docker compose logs -f ingestion-worker
-docker compose logs -f api
-```
-
-**Rebuild a single service after code changes**
-
-```bash
-docker compose up --build -d api
-docker compose up --build -d consumer-worker
-```
-
-**Check container health and status**
-
-```bash
-docker compose ps
-```
-
-**Scale the consumer worker to 3 parallel instances**
-
-```bash
-docker compose up -d --scale consumer-worker=3
-```
-
-Redpanda will automatically distribute topic partitions across all three instances. Useful when consumer lag is growing faster than a single instance can process.
-
-**Check consumer lag (how far behind the consumer is)**
-
-```bash
-docker compose exec redpanda rpk group describe health-metric-worker
-```
-
-**Connect to TimescaleDB with psql**
-
-```bash
-docker compose exec timescaledb psql -U oss -d oss_health
-```
-
-**Run a Redis command**
-
-```bash
-docker compose exec redis redis-cli TS.RANGE ts:redis/redis:health_score - +
+docker compose exec redis redis-cli TS.RANGE ts:facebook/react:health_score - +
 ```
 
 ---
 
 ## Accessing the UIs
 
-All interfaces are accessible from your browser once the containers are running.
-
-**Streamlit dashboard** — `http://localhost:8501`
-The main interface for browsing health scores, trends, and alerts.
-
-**FastAPI interactive docs** — `http://localhost:8080/docs`
-Swagger UI for exploring and testing every API endpoint directly in the browser.
-
-**Redpanda Console** — `http://localhost:9644`
-Browse topics, inspect individual messages, view consumer group lag, and monitor throughput. The "Consumer groups" section is the most useful for diagnosing processing slowdowns.
-
-**RedisInsight** — `http://localhost:8001`
-Browse all Redis keys, run commands, and inspect TimeSeries data visually. Use the TimeSeries chart view to see raw metric history without writing any code.
+- **Streamlit dashboard** — `http://localhost:8501` — health scores, trends, at-risk repos.
+- **FastAPI docs** — `http://localhost:8080/docs` — test every endpoint in the browser.
+- **MinIO console** — `http://localhost:9001` — browse the `bronze`, `silver`, `gold` buckets fill up.
+- **RedisInsight** — `http://localhost:8001` — browse keys and TimeSeries visually.
 
 ---
 
 ## Data Flow
 
-The complete journey of a single event through the system:
-
 ```
-GH Archive (external)
-  │  HTTP download — hourly .json.gz file
+GH Archive (hourly .json.gz)
+  │  download + integrity check
   ▼
-Ingestion Worker
-  │  produce(key=repo_name, value=event_json)
+BRONZE  — MinIO  gharchive/YYYY/MM/DD/…json.gz   (raw, immutable)
+  │  DuckDB: decompress, type, dedup, project
   ▼
-Redpanda — topic: gh-events
-  │  consumer reads at its own offset
+SILVER  — MinIO  events/event_date=…/hour=…parquet   (clean event table)
+  │  DuckDB: per-repo metric aggregation + IsolationForest risk
   ▼
-Consumer Worker — compute health metrics
-  ├─── TS.MADD + HSET ──────────────────▶ Redis Stack (hot, 7 days)
-  │                                              │
-  └─── INSERT INTO repo_health_metrics ──▶ TimescaleDB (cold, 2 years)
-                                                 │
-                                    ┌────────────┴────────────┐
-                                    │ FastAPI — routes by      │
-                                    │ time window requested    │
-                                    └────────────┬────────────┘
-                                                 │  HTTP JSON
-                                                 ▼
-                                          Streamlit Dashboard
+GOLD    — TimescaleDB (history) + Redis (hot) + MinIO gold/models
+  │  HTTP JSON
+  ▼
+api (FastAPI)  →  dashboard (Streamlit)
 ```
 
 ---
@@ -418,121 +332,70 @@ Consumer Worker — compute health metrics
 ## Project Structure
 
 ```
-oss-health-monitor/
-├── docker-compose.yml           # Defines all services, networks, volumes
-├── .env.example                 # Template — copy to .env and fill in values
-├── .env                         # Your local secrets — never commit this
-│
-├── data/
-│   └── parquet/                 # Bind-mounted — Parquet files persist here on the host
+Docker/
+├── docker-compose.yml           # all services, volumes, the default stack
+├── .env.example                 # template — copy to .env
+├── .env                         # local config — not committed
+├── MEDALLION.md                 # architecture + reasoning
+├── Docker.md                    # this file — container/ops reference
 │
 ├── init/
 │   └── timescale/
-│       └── 01_schema.sql        # Auto-executed by TimescaleDB on first boot
+│       ├── 01_schema.sql        # base gold schema (auto-run on first boot)
+│       └── 02_medallion.sql     # extra gold metric columns (active_actors, …)
 │
 └── services/
-    ├── ingestion/
-    │   ├── Dockerfile
-    │   ├── requirements.txt
-    │   └── main.py              # GH Archive download loop + GitHub API crawler
-    │
-    ├── consumer/
-    │   ├── Dockerfile
-    │   ├── requirements.txt
-    │   └── main.py              # Redpanda consumer + metric computation + dual-write
-    │
-    ├── api/
-    │   ├── Dockerfile
-    │   ├── requirements.txt
-    │   └── main.py              # FastAPI endpoints — routes queries to Redis or TimescaleDB
-    │
-    └── dashboard/
-        ├── Dockerfile
-        ├── requirements.txt
-        └── app.py               # Streamlit app — calls FastAPI, renders charts
+    ├── pipeline/                # the medallion orchestrator (built)
+    │   ├── Dockerfile  requirements.txt  README.md
+    │   ├── main.py              # scheduler + backfill / replay startup
+    │   ├── pipeline.py          # the DAG: run_hour / run_parquet_backfill / run_retention
+    │   ├── clock.py             # the (replay-shiftable) "now"
+    │   ├── bronze.py silver.py gold.py
+    │   ├── risk_model.py        # IsolationForest risk score
+    │   ├── backfill_parquet.py  # re-project monthly Parquet into silver
+    │   ├── retention.py         # prune aged bronze/silver in MinIO
+    │   ├── storage.py config.py
+    ├── api/                     # FastAPI (built)
+    └── dashboard/               # Streamlit (built)
 ```
 
 ---
 
 ## Troubleshooting
 
-**Container stuck in `starting` or `unhealthy`**
+**A container is stuck `starting` / `unhealthy`**
+TimescaleDB initialises its schema on first boot (~20–30 s); `pipeline`/`api`/`dashboard`
+wait for it via `condition: service_healthy`/`service_started`. Re-run `docker compose ps`.
 
-TimescaleDB takes 20–30 seconds to initialise its schema on the very first boot. The containers that depend on it (`consumer-worker`, `api`) will wait for it automatically via the `condition: service_healthy` dependency. Give it a minute and run `docker compose ps` again.
-
-**`ingestion-worker` exits immediately**
-
-The most common cause is a missing or invalid `GITHUB_TOKEN` in your `.env`. Check with:
-
-```bash
-docker compose logs ingestion-worker
-```
-
-If you see a 401 or 403 error, regenerate your token and restart the container:
-
-```bash
-docker compose up -d ingestion-worker
-```
-
-**Consumer lag keeps growing**
-
-The consumer is processing events more slowly than the ingestion worker produces them. Scale it up:
-
-```bash
-docker compose up -d --scale consumer-worker=3
-```
-
-You can also reduce the `INGESTION_START_DATE` in `.env` to a more recent date to limit the volume of historical backfill.
+**The dashboard is empty**
+Likely no gold data yet. GH Archive lags ~1–2 h, so the first live hour is a couple
+of hours old; either wait, or run a [backfill](#scheduled-jobs). Check `docker compose
+logs -f pipeline` for `gold: wrote N repos`.
 
 **Out of disk space**
-
-Parquet files accumulate in `./data/parquet/`. To clear old data:
-
-```bash
-# Delete Parquet files older than 90 days
-find ./data/parquet -name "*.parquet" -mtime +90 -delete
-```
-
-TimescaleDB manages its own disk usage via the 2-year retention policy set in the schema. Check current database size with:
+The daily retention job prunes MinIO automatically; to reclaim sooner, lower
+`BRONZE_RETENTION_DAYS` / `SILVER_RETENTION_DAYS` in `.env` (keep silver ≥ 90) and run
+the on-demand sweep above. TimescaleDB self-manages via its 2-year retention; check
+size with:
 
 ```bash
 docker compose exec timescaledb psql -U oss -d oss_health \
   -c "SELECT pg_size_pretty(pg_database_size('oss_health'));"
 ```
 
-**Redis running out of memory**
+**Commit metrics (bus_factor, commit_freq_30d) are empty**
+Those derive from PushEvent `commits`/`size`. Some GH Archive data (and synthetic
+data) ships PushEvents without the commit array. Use `REPLAY_OFFSET_YEARS` to process
+older real data that carries it. See `services/pipeline/clock.py`.
 
-Redis is configured with a 2 GB cap and an LRU eviction policy — when it reaches the limit, it automatically evicts the least recently used keys. If you are seeing important data being dropped, increase `REDIS_MAX_MEMORY` in `.env` and restart the Redis container:
+**Port already in use**
+Find the conflict (`lsof -i :8501`, etc.) and change the host-side number in the
+`"HOST:CONTAINER"` mapping in `docker-compose.yml`.
 
-```bash
-docker compose up -d redis
-```
-
-Note that Redis only stores the last 7 days of data per series by design. This is intentional — older data lives in TimescaleDB.
-
-**Can't connect to an API or UI in the browser**
-
-Verify the container is running and healthy:
+**Wipe one store without a full reset**
 
 ```bash
-docker compose ps
+docker compose stop minio
+docker volume rm docker_minio-data     # or timescale-data / redis-data
+docker compose up -d minio
 ```
-
-If the container is healthy but the UI is unreachable, check whether another process on your machine is already using the port:
-
-```bash
-lsof -i :8501   # or 8080, 9644, 8001, etc.
-```
-
-Change the conflicting port in `docker-compose.yml` (the left-hand number in `"HOST:CONTAINER"` port mappings) and restart.
-
-**Wiping a single service's data without a full reset**
-
-```bash
-# Remove only the Redis volume and restart
-docker compose stop redis
-docker volume rm oss-health-monitor_redis-data
-docker compose up -d redis
-```
-
-Replace `redis-data` with `timescale-data` or `redpanda-data` as needed.
