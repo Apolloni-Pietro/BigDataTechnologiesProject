@@ -164,7 +164,7 @@ def fetch_history(owner: str, name: str, days: int) -> pd.DataFrame:
 def fetch_at_risk(threshold: float = 0.35) -> pd.DataFrame:
     """Chiama l'endpoint GET /at-risk di FastAPI"""
     try:
-        resp = requests.get(f"{API_URL}/at-risk", params={"threshold": threshold, "limit": 500}, timeout=5)
+        resp = requests.get(f"{API_URL}/at-risk", params={"threshold": threshold, "limit": 5000}, timeout=5)
         resp.raise_for_status()
         data = resp.json()
         return pd.DataFrame(data.get("repos", []))
@@ -188,10 +188,12 @@ if page == "📊 Overview":
         st.info("No data yet. Waiting for FastAPI to return data...")
         st.stop()
 
+    df_at_risk = fetch_at_risk(threshold=0.35)
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Repos Tracked", len(df))
     c2.metric("Avg Health Score", fmt_metric("health_score", df["health_score"].mean()) if "health_score" in df.columns else "—")
-    c3.metric("At-Risk Repos (<35%)", len(df[df["health_score"] < 0.35]) if "health_score" in df.columns else "—")
+    c3.metric("At-Risk Repos (<35%)", len(df_at_risk))
     c4.metric("Healthy Repos (>70%)", len(df[df["health_score"] >= 0.70]) if "health_score" in df.columns else "—")
 
     st.divider()

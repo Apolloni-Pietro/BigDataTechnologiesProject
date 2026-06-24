@@ -360,4 +360,48 @@ def get_at_risk_repos(threshold: float = 0.35, limit: int = 20):
     Convenience endpoint: return repos whose health score is below
     the given threshold, sorted from worst to best.
     """
-    return list_repos(limit=limit, min_score=0.0, max_score=threshold)
+    if not pg_conn:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    try:
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT * FROM (
+                    SELECT DISTINCT ON (repo_name)
+                        repo_name,
+                        health_score,
+                        commit_freq_30d,
+                        bus_factor,
+                        stale_issue_ratio,
+                        active_actors,
+                        event_count,
+                        time
+                    FROM repo_health_metrics
+                    WHERE health_score >= 0.0 AND health_score < %s
+                    ORDER BY repo_name, time DESC
+                ) latest
+                ORDER BY health_score ASC
+                LIMIT %s
+                """,
+                (threshold, limit),
+            )
+            rows = cur.fetchall()
+    except Exception as e:
+        log.error(f"Database query failed: {e}")
+        raise HTTPException(status_code=500, detail="Query failed")
+    return {
+        "repos": [
+            {
+                "repo_name":         row[0],
+                "health_score":      row[1],
+                "commit_freq_30d":   row[2],
+                "bus_factor":        row[3],
+                "stale_issue_ratio": row[4],
+                "active_actors":     row[5],
+                "event_count":       row[6],
+                "last_updated":      row[7].isoformat() if row[7] else None,
+            }
+            for row in rows
+        ],
+        "count": len(rows),
+    }
