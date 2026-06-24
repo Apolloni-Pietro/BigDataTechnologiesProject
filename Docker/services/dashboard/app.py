@@ -285,25 +285,6 @@ elif page == "🔎 Repository Detail":
             for i, key in enumerate(shown):
                 cols[i % 4].metric(METRIC_LABELS.get(key, key), fmt_metric(key, metrics.get(key)))
 
-            st.divider()
-
-            st.subheader("Health Trend")
-            days = st.slider("Time window (days)", min_value=1, max_value=90, value=7)
-            df_history = fetch_history(owner, name, days)
-
-            if df_history.empty:
-                if _FETCH_HISTORY_ERROR.get("msg"):
-                    st.warning(f"Could not load history: {_FETCH_HISTORY_ERROR['msg']}")
-                else:
-                    st.info("No historical data available for this time window yet.")
-            else:
-                df_history.reset_index(inplace=True)
-                fig_line = px.line(df_history, x="time", y="health_score",
-                                   title="Health Score Over Time",
-                                   labels={"time": "Date", "health_score": METRIC_LABELS["health_score"]})
-                fig_line.update_yaxes(range=[0, 1], tickformat=".0%")
-                st.plotly_chart(fig_line, use_container_width=True)
-
             with st.expander("Raw API payload (From FastAPI)"):
                 st.json(data["metrics"])
 
