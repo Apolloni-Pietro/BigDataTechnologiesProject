@@ -1,6 +1,26 @@
-.bigdataeda/
+# Ignore the Python virtual environment directory
+.python_env/
+
+# Working directory for raw JSON files
 raw_json/
+
+# Working directory for processed Parquet files
 processed_parquet/
-Tests/
-.secrets/ # Ignore the .secrets directory which contains sensitive information
-.DS_Store # Ignore macOS specific file
+
+# Ignore the .secrets directory which contains sensitive information
+.secrets/
+
+# Ignore macOS Finder metadata files
+.DS_Store
+
+# Ignore the Docker environment file which contains sensitive information
+Docker/.env
+
+# Ignore Python cache files
+__pycache__/
+
+# Ignore Agent files
+CLAUDE.md
+
+# Ignore the benchmark script
+bench_convert.py

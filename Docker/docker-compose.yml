@@ -1,0 +1,232 @@
+services:
+  # ────────────────────────────────────────────────
+  # INFRASTRUCTURE
+  # ────────────────────────────────────────────────
+
+  # MinIO is the BRONZE + SILVER backend: an S3-compatible object store.
+  # Raw GH Archive files and cleaned Parquet live here. See MEDALLION.md §3.
+  minio:
+    image: minio/minio:latest
+    container_name: oss-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # MinIO web console
+    volumes:
+      - minio-data:/data
+    # No Docker healthcheck here: the minio/minio server image is minimal and
+    # does not reliably ship `mc`/`curl`. The pipeline service has its own
+    # wait_for_minio() retry loop instead, so it depends on `service_started`.
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: oss-timescaledb
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-oss}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${POSTGRES_DB:-oss_health}
+      # ${VAR:-default} syntax: use the .env value if set,
+      # otherwise fall back to the default on the right.
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescale-data:/var/lib/postgresql/data
+      # This named volume persists your database across container restarts.
+      - ./init/timescale:/docker-entrypoint-initdb.d
+      # Any .sql or .sh file in this directory is executed automatically
+      # the FIRST TIME the container starts with an empty data volume.
+      # This is how we create the schema without running manual commands.
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-oss} -d ${POSTGRES_DB:-oss_health}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  redis:
+    image: redis/redis-stack:latest
+    # redis-stack is NOT the same as plain redis. It bundles additional
+    # modules: RedisTimeSeries (which we use), RediSearch, RedisJSON.
+    # The plain redis image does NOT have TS.ADD, TS.RANGE etc.
+    container_name: oss-redis
+    ports:
+      - "6379:6379" # Redis protocol
+      - "8001:8001" # RedisInsight web UI
+    volumes:
+      - redis-data:/data
+    command: >
+      redis-stack-server
+      --save 60 1
+      --maxmemory ${REDIS_MAX_MEMORY:-2gb}
+      --maxmemory-policy allkeys-lru
+      --loglevel warning
+    # --save 60 1: persist to disk if at least 1 key changed in 60 seconds
+    # allkeys-lru: when memory is full, evict the least-recently-used key.
+    # This is safe here because old data lives in TimescaleDB anyway.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  mqtt:
+    image: eclipse-mosquitto:2
+    container_name: oss-mqtt
+    ports:
+      - "1883:1883" # MQTT protocol (external clients)
+      - "9883:9883" # MQTT over WebSockets (browser clients)
+    volumes:
+      - ./init/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    restart: unless-stopped
+
+  # ────────────────────────────────────────────────
+  # PIPELINE (the ingestion path)
+  # ────────────────────────────────────────────────
+
+  # The medallion pipeline: the ingestion path. Hourly bronze->silver->
+  # gold over GH Archive, ML risk scoring.
+  pipeline:
+    build:
+      context: ./services/pipeline
+    container_name: oss-pipeline
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_SECURE: "false"
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-oss}:${POSTGRES_PASSWORD:-changeme}@timescaledb:5432/${POSTGRES_DB:-oss_health}
+      REDIS_URL: redis://redis:6379
+      # Optional one-shot historical replay on startup (format YYYY-MM-DD-H).
+      BACKFILL_START: ${BACKFILL_START:-}
+      BACKFILL_END: ${BACKFILL_END:-}
+      # Optional parquet backfill: set to /backfill to ingest the pre-downloaded
+      # monthly Parquet files mounted below. Takes precedence over BACKFILL_START/END.
+      # See PARQUET_BACKFILL.md.
+      BACKFILL_PARQUET_DIR: ${BACKFILL_PARQUET_DIR:-}
+      DUCKDB_MEMORY_LIMIT: ${DUCKDB_MEMORY_LIMIT:-8GB}
+      # Replay: shift the pipeline's "now" back N years (0 = off). See clock.py.
+      REPLAY_OFFSET_YEARS: ${REPLAY_OFFSET_YEARS:-0}
+      # Rolling-window sizes (widen for a replay of an older single month).
+      CONTRIBUTOR_WINDOW_DAYS: ${CONTRIBUTOR_WINDOW_DAYS:-90}
+      COMMIT_FREQ_WINDOW_DAYS: ${COMMIT_FREQ_WINDOW_DAYS:-30}
+      # Filename glob for the parquet backfill (restrict to specific months).
+      BACKFILL_PARQUET_GLOB: ${BACKFILL_PARQUET_GLOB:-gh_events_*.parquet}
+      # Mode B parquet backfill: MinIO bucket name where the user uploaded parquet
+      # files with `mc`. Takes precedence over BACKFILL_PARQUET_DIR. See PARQUET_BACKFILL.md.
+      BACKFILL_PARQUET_BUCKET: ${BACKFILL_PARQUET_BUCKET:-}
+      # Retention: prune aged MinIO objects so 24/7 operation doesn't fill disk.
+      BRONZE_RETENTION_DAYS: ${BRONZE_RETENTION_DAYS:-30}
+      SILVER_RETENTION_DAYS: ${SILVER_RETENTION_DAYS:-120}
+      RETENTION_CRON_HOUR: ${RETENTION_CRON_HOUR:-4}
+      MQTT_ALERT_THRESHOLD: ${MQTT_ALERT_THRESHOLD:-0.4}
+    volumes:
+      # Mode A (bind-mount) only: pre-downloaded parquet files mounted at /backfill.
+      # Set BACKFILL_PARQUET_DIR=/backfill in .env to activate. Harmless otherwise.
+      # Mode B (MinIO-upload): this mount has no effect; set BACKFILL_PARQUET_BUCKET instead.
+      - ../processed_parquet:/backfill:ro
+    depends_on:
+      minio:
+        condition: service_started
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mqtt:
+        condition: service_started
+    restart: unless-stopped
+
+  # ────────────────────────────────────────────────
+  # OPTIONAL: Mode B parquet-upload helper
+  # ────────────────────────────────────────────────
+  # One-shot service to upload local parquet files into MinIO before starting
+  # the full pipeline (Mode B workflow). Activate with the "upload" profile:
+  #
+  #   1. Set BACKFILL_PARQUET_BUCKET=parquet-backfill in .env
+  #   2. docker compose up -d minio
+  #   3. docker compose --profile upload run --rm mc-upload
+  #   4. docker compose up -d
+  #
+  # See PARQUET_BACKFILL.md §Mode B.
+  #
+  mc-upload:
+    image: minio/mc:latest
+    profiles: ["upload"]
+    depends_on:
+      minio:
+        condition: service_started
+    environment:
+      BUCKET: ${BACKFILL_PARQUET_BUCKET:-parquet-backfill}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - ../processed_parquet:/data:ro
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >
+        mc alias set local http://minio:9000 $$MINIO_ACCESS_KEY $$MINIO_SECRET_KEY &&
+        mc mb --ignore-existing local/$$BUCKET &&
+        mc cp /data/*.parquet local/$$BUCKET/ &&
+        echo "Upload complete."
+
+  # ────────────────────────────────────────────────
+  # SERVING
+  # ────────────────────────────────────────────────
+
+  api:
+    build:
+      context: ./services/api
+    container_name: oss-api
+    ports:
+      - "8080:8080"
+    environment:
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-oss}:${POSTGRES_PASSWORD:-changeme}@timescaledb:5432/${POSTGRES_DB:-oss_health}
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  dashboard:
+    build:
+      context: ./services/dashboard
+    container_name: oss-dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      API_URL: http://api:8080
+      # The dashboard calls FastAPI over Docker's internal network.
+      # It never touches Redis or TimescaleDB directly.
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+# ────────────────────────────────────────────────
+# NAMED VOLUMES
+# ────────────────────────────────────────────────
+
+volumes:
+  timescale-data:
+  redis-data:
+  minio-data:
+  # These are managed by Docker. Data persists across `docker compose down`
+  # but is deleted by `docker compose down -v`.
+  # Unlike bind mounts, you cannot browse them directly in Finder/Explorer.
+  # Use `docker volume inspect oss-health-monitor_timescale-data` to find
+  # where Docker stores them on disk.
