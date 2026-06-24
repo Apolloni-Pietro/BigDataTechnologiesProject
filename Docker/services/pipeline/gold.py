@@ -272,7 +272,10 @@ def build() -> int:
     # a Redis outage discard an already-committed gold cycle — log and move on.
     try:
         r_client = redis_lib.Redis.from_url(config.REDIS_URL, decode_responses=True)
-        _write_redis(r_client, rows)
+        try:
+            _write_redis(r_client, rows)
+        finally:
+            r_client.close()
     except Exception:
         log.exception("gold: redis phase failed; timescale write is already committed")
 

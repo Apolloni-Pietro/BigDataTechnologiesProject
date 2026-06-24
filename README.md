@@ -2,7 +2,7 @@
 
 A platform that continuously measures the **health of open-source software** on
 GitHub. It ingests public GitHub events from [GH Archive](https://www.gharchive.org/),
-organises them as a **bronze → silver → gold** medallion lakehouse, computes per-repo
+organizes them as a **bronze → silver → gold** medallion lakehouse, computes per-repo
 health metrics (commit cadence, bus factor, PR/issue responsiveness, release cadence,
 maintenance gaps), attaches an unsupervised **ML risk score**, and serves the result
 through a REST API and a live dashboard.
@@ -23,15 +23,11 @@ hourly batch product, so an in-container scheduler drives the pipeline. An MQTT 
 
 The `pipeline` container orchestrates everything on an in-process scheduler (UTC):
 
-| When                  | Job             | What it does                                                         |
-| --------------------- | --------------- | -------------------------------------------------------------------- |
-| Hourly at `:15`       | `hourly_job`    | latest GH Archive hour → bronze → silver → gold (metrics + ML risk)  |
-| Daily at `04:45`      | `retention_job` | prune aged bronze/silver in MinIO so 24/7 operation doesn't fill disk |
+| When                  | Job             | What it does                                                           |
+| --------------------- | --------------- | ---------------------------------------------------------------------- |
+| Hourly at `:15`       | `hourly_job`    | latest GH Archive hour → bronze → silver → gold (metrics + ML risk)    |
+| Daily at `04:45`      | `retention_job` | prune aged bronze/silver in MinIO so 24/7 operation doesn't fill disk  |
 | On startup (optional) | `backfill`      | replay a fixed historical hour range, or ingest pre-downloaded Parquet |
-
-**Deeper docs:** [`Docker/Docker.md`](Docker/Docker.md) (container/ops reference),
-[`Docker/MEDALLION.md`](Docker/MEDALLION.md) (architecture + reasoning),
-[`Docker/services/pipeline/README.md`](Docker/services/pipeline/README.md) (pipeline internals).
 
 ---
 
@@ -64,8 +60,7 @@ python3 GHArchiveDownload.py
 Output lands in `processed_parquet/gh_events_YYYY-MM.parquet` (one file per month).
 Raw `.json.gz` files are cleaned up after each successful conversion.
 
-> **Tip:** each month of GH Archive is roughly 2–4 GB of Parquet. One month is enough
-> to get meaningful metrics. Adjust `MAX_WORKERS` to your bandwidth (default 35).
+> **Tip:** each month of GH Archive is roughly 13-15 GB of Parquet. Adjust `MAX_WORKERS` to your bandwidth (default 35).
 
 ---
 
@@ -136,7 +131,6 @@ live hourly scheduler takes over automatically when it finishes.
 | Dashboard (Streamlit) | `http://localhost:8501`      |
 | API docs (FastAPI)    | `http://localhost:8080/docs` |
 | MinIO console         | `http://localhost:9001`      |
-| RedisInsight          | `http://localhost:8001`      |
 
 MinIO console login: `minioadmin` / `minioadmin` (the defaults from `.env.example`).
 
@@ -163,16 +157,51 @@ time. The dashboard will be sparse until enough hourly cycles accumulate.
 
 ## Configuration
 
-Everything is configured via `Docker/.env` (copied from `.env.example`). The full
-table lives in [`Docker/Docker.md`](Docker/Docker.md#environment-variables); the most
-relevant settings:
+### Environment Variables
 
-- `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` — object-store credentials.
-- `BACKFILL_PARQUET_DIR` — set to `/backfill` to activate Mode A Parquet backfill.
-- `BACKFILL_START` / `BACKFILL_END` — optional one-shot GH Archive hour-range replay (`YYYY-MM-DD-H`).
-- `REPLAY_OFFSET_YEARS` — process the feed from N years ago (0 = off; see below).
-- `BRONZE_RETENTION_DAYS` (30) / `SILVER_RETENTION_DAYS` (120) — see [Retention](#retention).
-- `POSTGRES_*`, `REDIS_MAX_MEMORY` — database tuning.
+Copy `.env.example` to `.env` and edit.
+
+| Variable                  | Default                                                 | Description                                                                                                             |
+| ------------------------- | ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `MINIO_ENDPOINT`          | `minio:9000`                                            | Hostname and port of the MinIO S3-compatible service.                                                                   |
+| `MINIO_ACCESS_KEY`        | `minioadmin`                                            | Root username / access key credentials for the MinIO object store.                                                      |
+| `MINIO_SECRET_KEY`        | `minioadmin`                                            | Root password / secret key credentials for the MinIO object store.                                                      |
+| `MINIO_SECURE`            | `false`                                                 | Boolean indicating whether to connect to MinIO via SSL/TLS (HTTPS).                                                     |
+| `BRONZE_BUCKET`           | `bronze`                                                | Name of the MinIO bucket holding raw GH Archive JSON files.                                                             |
+| `SILVER_BUCKET`           | `silver`                                                | Name of the MinIO bucket holding cleaned and typed Parquet partition files.                                             |
+| `GOLD_BUCKET`             | `gold`                                                  | Name of the MinIO bucket storing gold layer snapshot outputs.                                                           |
+| `POSTGRES_USER`           | `oss`                                                   | Username for connecting to the PostgreSQL/TimescaleDB database.                                                         |
+| `POSTGRES_PASSWORD`       | `changeme`                                              | Password for connecting to the PostgreSQL/TimescaleDB database.                                                         |
+| `POSTGRES_DB`             | `oss_health`                                            | Target database name in PostgreSQL/TimescaleDB.                                                                         |
+| `POSTGRES_DSN`            | `postgresql://oss:changeme@timescaledb:5432/oss_health` | Fully qualified PostgreSQL connection DSN URL.                                                                          |
+| `REDIS_URL`               | `redis://redis:6379`                                    | Connection string URL for the Redis server instance.                                                                    |
+| `REDIS_MAX_MEMORY`        | `2gb`                                                   | RAM limit cap for the Redis server before evicting keys via LRU policies.                                               |
+| `GHARCHIVE_BASE`          | `https://data.gharchive.org`                            | Base URL endpoint used to retrieve hourly JSON logs from GH Archive.                                                    |
+| `PUBLISH_LAG_HOURS`       | `2`                                                     | Hour lag offset between real-time and the most recently published GH Archive hourly dump.                               |
+| `REPLAY_OFFSET_YEARS`     | `0`                                                     | Time shift offset in years to process historical logs as if they were current events.                                   |
+| `BACKFILL_START`          | _(empty)_                                               | Timestamp (format `YYYY-MM-DD-H`) to initiate one-shot historical hourly backfilling or Parquet transition seam.        |
+| `BACKFILL_END`            | _(empty)_                                               | End hour boundary (format `YYYY-MM-DD-H`) up to which the one-shot download ingestion backfill will run.                |
+| `BACKFILL_PARQUET_DIR`    | _(empty)_                                               | Container path holding monthly Parquet files for fast-path ingestion (Mode A).                                          |
+| `BACKFILL_PARQUET_GLOB`   | `gh_events_*.parquet`                                   | Filename glob filters matching specific month files to process in Parquet backfill.                                     |
+| `BACKFILL_PARQUET_BUCKET` | _(empty)_                                               | MinIO bucket name containing uploaded Parquet files to download/ingest directly from object storage (Mode B).           |
+| `DUCKDB_MEMORY_LIMIT`     | `8GB`                                                   | Max memory limit allocated for DuckDB connections to prevent container OOMs during heavy aggregations.                  |
+| `DUCKDB_TEMP_DIR`         | `/tmp/duckdb_spill`                                     | Temp spill directory on disk for DuckDB when operations exceed memory cap.                                              |
+| `DUCKDB_THREADS`          | `4`                                                     | Max parallel CPU worker threads allocated for DuckDB computations.                                                      |
+| `COMMIT_FREQ_WINDOW_DAYS` | `30`                                                    | Size in days of rolling window timeline used for measuring commit frequency metrics in the Gold layer.                  |
+| `CONTRIBUTOR_WINDOW_DAYS` | `90`                                                    | Size in days of rolling query window used for counting active actors/contributors in the Gold layer.                    |
+| `STALE_ISSUE_DAYS`        | `90`                                                    | Standard duration of inactivity in days used to label open issues as stale.                                             |
+| `GOLD_MAX_REPOS`          | `5000`                                                  | Upper bound limit on top tracked repositories by actor volume scored in Gold layer database tables.                     |
+| `GOLD_MIN_ACTORS`         | `3`                                                     | Minimum unique active human actors needed over the contributor window for a repository to be tracked in the Gold layer. |
+| `BRONZE_RETENTION_DAYS`   | `30`                                                    | Lifespan duration threshold in days before deleting transient raw files from the bronze object store.                   |
+| `SILVER_RETENTION_DAYS`   | `120`                                                   | Lifespan duration threshold in days before deleting processed partition Parquet files from the silver store.            |
+| `RETENTION_CRON_HOUR`     | `4`                                                     | Hour of day (UTC format) when the periodic retention cleanup task runs.                                                 |
+| `MQTT_BROKER_HOST`        | `mqtt`                                                  | Hostname connection address for the Mosquitto MQTT message broker instance.                                             |
+| `MQTT_BROKER_PORT`        | `1883`                                                  | TCP port configuration for target MQTT connection.                                                                      |
+| `MQTT_ALERT_THRESHOLD`    | `0.35`                                                  | The health score threshold below which repository alerts are published to the MQTT broker alerts topic.                 |
+| `API_URL`                 | `http://api:8080`                                       | FastAPI endpoint URL used by the Streamlit dashboard component.                                                         |
+| `BUCKET`                  | `parquet-backfill`                                      | Target upload bucket name used inside the helper script for the parquet upload service.                                 |
+
+---
 
 ### Replaying historical data (`REPLAY_OFFSET_YEARS`)
 
@@ -181,9 +210,9 @@ so it fetches and processes the feed from exactly a year ago and then runs "live
 year-old events. A single shifted clock ([`clock.py`](Docker/services/pipeline/clock.py))
 drives the scheduler, gold's rolling windows, and retention together — the data keeps its
 true dates. Startup runs parquet bulk → hourly tail → live, all year-shifted. This is
-useful because **older GH Archive data carries full PushEvent commit arrays**, so the
-commit-based metrics (bus factor, commit frequency, contributor count) populate — some
-newer data omits them.
+necessary because **older GH Archive data carries full PushEvent commit arrays**, so the
+commit-based metrics (bus factor, commit frequency, contributor count) populate —
+newer data omit them.
 
 ### Retention
 
@@ -194,20 +223,6 @@ grow forever under 24/7 ingestion. The daily retention job prunes it with **two 
 - **Silver** is the history gold aggregates over rolling windows, so it **must stay
   ≥ 90 days** (the largest window) or metrics degrade at the edge → `SILVER_RETENTION_DAYS`
   (120). The pipeline warns if you set it below 90.
-
----
-
-## Deploying 24/7 (free)
-
-The stack is stateful and accumulates storage, so the realistic free options are:
-
-- **Oracle Cloud Always Free** (Ampere A1: up to 4 OCPU / 24 GB RAM / 200 GB) — the best
-  free cloud fit; runs the whole stack 24/7 (arm64 images, all supported).
-- **A local always-on machine** (spare laptop, mini-PC, or Raspberry Pi 5 8 GB) with
-  Docker; add a free Cloudflare Tunnel for a public URL. Lower `REDIS_MAX_MEMORY` to
-  `1gb` on 8 GB hosts.
-
-The retention job above is what makes either viable long-term.
 
 ---
 
@@ -249,7 +264,7 @@ repos/{owner}/{repo}/alerts
   "repo": "owner/repo",
   "health_score": 0.31,
   "previous_health_score": 0.76,
-  "threshold": 0.4,
+  "threshold": 0.35,
   "ts": 1782228400
 }
 ```
@@ -271,7 +286,7 @@ Both are exposed on `localhost` when the stack is running.
 Set in `Docker/.env`:
 
 ```dotenv
-MQTT_ALERT_THRESHOLD=0.4   # alert when health_score drops below this (0.0–1.0)
+MQTT_ALERT_THRESHOLD=0.35   # alert when health_score drops below this (0.0–1.0)
 ```
 
 ### Subscribing to alerts
@@ -308,7 +323,7 @@ docker compose exec pipeline python demo_alert.py \
 Terminal 1 will immediately print:
 
 ```
-repos/demo-org/demo-repo/alerts {"repo": "demo-org/demo-repo", "health_score": 0.25, "previous_health_score": 0.85, "threshold": 0.4, "ts": ...}
+repos/demo-org/demo-repo/alerts {"repo": "demo-org/demo-repo", "health_score": 0.25, "previous_health_score": 0.85, "threshold": 0.35, "ts": ...}
 ```
 
 The script seeds Redis with the "previous" score, publishes the alert, then removes the
@@ -320,10 +335,9 @@ fake key — no side-effects on the running pipeline.
 
 ```
 GHArchiveDownload.py     standalone GH Archive → typed monthly Parquet (bronze/silver logic)
-Docker/                  the full Dockerised platform
+Docker/                  the full Dockerized platform
   docker-compose.yml     the 7-container stack
   MEDALLION.md           architecture + design reasoning
-  Docker.md              container/operations reference
   PARQUET_BACKFILL.md    fast history ingestion from pre-downloaded Parquet
   init/timescale/        gold schema (auto-applied on first boot)
   services/pipeline/     the medallion orchestrator (bronze→silver→gold, ML, retention)

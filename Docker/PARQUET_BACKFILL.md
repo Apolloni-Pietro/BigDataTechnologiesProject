@@ -6,8 +6,7 @@ The default backfill (`BACKFILL_START`/`BACKFILL_END`) re-**downloads** every ho
 from GH Archive — correct but slow and flaky over months.
 
 **Parquet backfill** is the fast alternative: it ingests **pre-downloaded monthly
-`.parquet` files** straight into the silver layer, skipping the download + JSON-parse
-work entirely. Expect roughly **6–10× faster** for a year-scale backfill.
+`.parquet` files** straight into the silver layer.
 
 Both modes can optionally chain a GH Archive hourly download after the parquet phase
 using `BACKFILL_START` as the seam — giving you a complete history without redundancy.
@@ -26,7 +25,7 @@ backfill_parquet.build_month()  ── DuckDB: re-project to the EXACT silver sc
 SILVER (MinIO)  events/event_date=YYYY-MM-DD/…parquet
         │   normal silver → gold transform
         ▼
-GOLD (TimescaleDB + Redis)  ──►  API ──► dashboard
+GOLD (TimescaleDB + Redis)
 ```
 
 - **Bronze is bypassed.** The monthly file is already typed/exploded, so there is no
@@ -79,9 +78,6 @@ cd Docker
 
 # Start clean so backfill output is the only silver data (recommended):
 docker compose down -v
-
-# Enable Mode A in .env:
-echo "BACKFILL_PARQUET_DIR=/backfill" >> .env
 
 # Optional: chain a GH Archive hourly download after the parquet phase.
 # Parquet will stop at 2025-06-22; hourly will cover 2025-06-23 → now.
