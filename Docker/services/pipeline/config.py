@@ -106,7 +106,7 @@ RETENTION_CRON_HOUR   = int(os.getenv("RETENTION_CRON_HOUR", "4"))   # daily, 04
 MQTT_BROKER_HOST    = os.getenv("MQTT_BROKER_HOST", "mqtt")
 MQTT_BROKER_PORT    = int(os.getenv("MQTT_BROKER_PORT", "1883"))
 # Alert fires when health_score drops BELOW this threshold (0.0–1.0).
-MQTT_ALERT_THRESHOLD = float(os.getenv("MQTT_ALERT_THRESHOLD", "0.4"))
+MQTT_ALERT_THRESHOLD = float(os.getenv("MQTT_ALERT_THRESHOLD", "0.35"))
 
 # Event types we keep in silver (everything else is noise for health metrics).
 TRACKED_EVENT_TYPES = (

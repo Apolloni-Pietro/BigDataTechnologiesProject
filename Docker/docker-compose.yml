@@ -125,7 +125,7 @@ services:
       BRONZE_RETENTION_DAYS: ${BRONZE_RETENTION_DAYS:-30}
       SILVER_RETENTION_DAYS: ${SILVER_RETENTION_DAYS:-120}
       RETENTION_CRON_HOUR: ${RETENTION_CRON_HOUR:-4}
-      MQTT_ALERT_THRESHOLD: ${MQTT_ALERT_THRESHOLD:-0.4}
+      MQTT_ALERT_THRESHOLD: ${MQTT_ALERT_THRESHOLD:-0.35}
     volumes:
       # Mode A (bind-mount) only: pre-downloaded parquet files mounted at /backfill.
       # Set BACKFILL_PARQUET_DIR=/backfill in .env to activate. Harmless otherwise.
