@@ -7,8 +7,8 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Configuration ---
-START_DATE = "2025-04-01" 
-END_DATE = "2025-04-30" 
+START_DATE = "2025-01-01" 
+END_DATE = "2025-06-30" 
 RAW_DIR = "./raw_json"
 PARQUET_DIR = "./processed_parquet"
 MAX_WORKERS = 35 # Edit according to available internet bandwidth
