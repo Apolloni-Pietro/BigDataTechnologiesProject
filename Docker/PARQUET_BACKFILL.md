@@ -110,20 +110,18 @@ docker compose down -v
 # Set Mode B in .env:
 echo "BACKFILL_PARQUET_BUCKET=parquet-backfill" >> .env
 
-# Optional seam: parquet covers up to 2025-06-22; hourly starts here.
-# echo "BACKFILL_START=2025-06-23-0" >> .env
-
 # 1. Start MinIO alone:
 docker compose up -d minio
 
-# 2. Upload parquet files (adjust the host path as needed):
-docker run --rm \
+# 2. Upload parquet files (adjust the host path as needed), the command shown works when run from the Docker directory:
+docker run --rm -t \
   --network docker_default \
-  -v /path/to/processed_parquet:/data:ro \
-  minio/mc:latest /bin/sh -c "
+  -v "$(pwd)/../processed_parquet:/data:ro" \
+  --entrypoint /bin/sh \
+  minio/mc:latest -c "
     mc alias set local http://minio:9000 minioadmin minioadmin &&
     mc mb --ignore-existing local/parquet-backfill &&
-    mc cp /data/*.parquet local/parquet-backfill/
+    mc cp --recursive /data/ local/parquet-backfill/
   "
 
 # 3. Start everything:
@@ -132,6 +130,7 @@ docker compose logs -f pipeline
 ```
 
 Alternatively, uncomment the `mc-upload` service in `docker-compose.yml` and run:
+
 ```bash
 docker compose up -d minio
 docker compose --profile upload run --rm mc-upload
@@ -142,12 +141,12 @@ docker compose up -d
 
 ## Choosing between Mode A and Mode B
 
-| | Mode A (bind-mount) | Mode B (MinIO-upload) |
-|---|---|---|
-| **Extra steps** | None — files stay local | Upload to MinIO first |
-| **Bind-mount required** | Yes (`../processed_parquet` must exist) | No |
-| **Files accessible after stack restart** | Only if host dir still present | Yes — in MinIO named volume |
-| **Best for** | Local dev / one-off backfills | Clean environments, shared setups |
+|                                          | Mode A (bind-mount)                     | Mode B (MinIO-upload)             |
+| ---------------------------------------- | --------------------------------------- | --------------------------------- |
+| **Extra steps**                          | None — files stay local                 | Upload to MinIO first             |
+| **Bind-mount required**                  | Yes (`../processed_parquet` must exist) | No                                |
+| **Files accessible after stack restart** | Only if host dir still present          | Yes — in MinIO named volume       |
+| **Best for**                             | Local dev / one-off backfills           | Clean environments, shared setups |
 
 ---
 
@@ -162,6 +161,7 @@ scheduler      → takes over from there
 ```
 
 Example for Mode B:
+
 ```dotenv
 BACKFILL_PARQUET_BUCKET=parquet-backfill
 BACKFILL_START=2025-06-23-0
@@ -172,7 +172,7 @@ every hour from 2025-06-23-0 onward before the scheduler takes over. No overlap,
 no gap, no double-counting in gold.
 
 Without `BACKFILL_START`: the parquet phase ingests all available files and the
-scheduler starts immediately (no hourly chain — original behaviour).
+scheduler starts immediately (no hourly chain).
 
 ---
 
@@ -188,13 +188,13 @@ scheduler starts immediately (no hourly chain — original behaviour).
 
 ## Configuration reference
 
-| Variable                  | Default               | Meaning |
-| ------------------------- | --------------------- | ------- |
-| `BACKFILL_PARQUET_DIR`    | _(empty)_             | **Mode A**: container path holding the monthly files. Set to `/backfill`. |
-| `BACKFILL_PARQUET_BUCKET` | _(empty)_             | **Mode B**: MinIO bucket name where files were uploaded. Takes precedence over Mode A. |
-| `BACKFILL_PARQUET_GLOB`   | `gh_events_*.parquet` | Filename glob within the source (applied in both modes). |
+| Variable                  | Default               | Meaning                                                                                                                                                     |
+| ------------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BACKFILL_PARQUET_DIR`    | _(empty)_             | **Mode A**: container path holding the monthly files. Set to `/backfill`.                                                                                   |
+| `BACKFILL_PARQUET_BUCKET` | _(empty)_             | **Mode B**: MinIO bucket name where files were uploaded. Takes precedence over Mode A.                                                                      |
+| `BACKFILL_PARQUET_GLOB`   | `gh_events_*.parquet` | Filename glob within the source (applied in both modes).                                                                                                    |
 | `BACKFILL_START`          | _(empty)_             | Seam hour (`YYYY-MM-DD-H`). When set alongside a parquet mode, caps parquet at `day_before(BACKFILL_START)` and chains an hourly download from here to now. |
-| `BACKFILL_END`            | _(empty)_             | End hour for the hourly-only backfill (no parquet). Unused when a parquet mode is active. |
+| `BACKFILL_END`            | _(empty)_             | End hour for the hourly-only backfill (no parquet). Unused when a parquet mode is active.                                                                   |
 
 The bind-mount lives in [`docker-compose.yml`](docker-compose.yml) under the `pipeline`
 service (`../processed_parquet:/backfill:ro`). It is harmless when Mode B is active or
