@@ -58,7 +58,13 @@ data and no streaming path; every number comes from real GitHub events.
 │  ┌────────────────────────────┴──────────────────────┴──────────────────┐ │
 │  │ pipeline (APScheduler)                                               │ │
 │  │  hourly: bronze → silver → gold              daily: retention        │ │
-│  └───────────────────────────────┬───────────────────┬──────────────────┘ │
+│  └────────────────────────────────┬──────────────────┬─────────┬────────┘ │
+│                                   │                  │         │ alerts   │
+│  ── MQTT Broker ───────────────────────────────────────────────▼────────   │
+│  ┌──────────────────────────────────────────────────────────────────────┐ │
+│  │ mqtt (Mosquitto 2)    :1883 (TCP)    :9883 (WebSockets)              │ │
+│  └──────────────────────────────────────────────────────────────────────┘ │
+│                                   │                  │                    │
 │                                  │ write gold        │ write gold         │
 │  ── Serving Stores ──────────────▼───────────────────▼─────────────────   │
 │  ┌──────────────────────────┐        ┌──────────────────────────────────┐ │
@@ -79,8 +85,8 @@ data and no streaming path; every number comes from real GitHub events.
 └──────────────────────────────────────────────────────────────────────────-┘
 ```
 
-Six containers. Three run from **prebuilt public images** (`minio`, `timescaledb`,
-`redis`); three are **built from Dockerfiles** (`pipeline`, `api`, `dashboard`).
+Seven containers. Four run from **prebuilt public images** (`minio`, `timescaledb`,
+`redis`, `mqtt`); three are **built from Dockerfiles** (`pipeline`, `api`, `dashboard`).
 
 ---
 
@@ -172,6 +178,7 @@ Copy `.env.example` to `.env` and edit. Never commit `.env` — it is in `.gitig
 | `POSTGRES_PASSWORD`     | `changeme`   | TimescaleDB password. Change if the port is exposed.                                                            |
 | `POSTGRES_DB`           | `oss_health` | TimescaleDB database name.                                                                                      |
 | `REDIS_MAX_MEMORY`      | `2gb`        | Redis memory cap before LRU eviction. Reduce to `1gb` on < 8 GB machines.                                       |
+| `MQTT_ALERT_THRESHOLD`  | `0.4`        | Publish an alert to `repos/{owner}/{repo}/alerts` when a repo's `health_score` drops below this value (edge-triggered). |
 
 ---
 
@@ -216,6 +223,14 @@ charts). Memory-capped with LRU eviction — safe because the full history lives
 TimescaleDB.
 
 **Ports:** `6379` (Redis), `8001` (RedisInsight UI).
+
+### Mosquitto (`mqtt`)
+
+The MQTT broker (Eclipse Mosquitto 2). After each gold cycle the `pipeline` publishes
+an edge-triggered alert whenever a repo's `health_score` drops below
+`MQTT_ALERT_THRESHOLD`. See [MQTT alerts in the root README](../README.md#mqtt-alerts).
+
+**Ports:** `1883` (MQTT/TCP), `9883` (MQTT over WebSockets).
 
 ### FastAPI (`api`)
 

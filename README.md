@@ -11,43 +11,6 @@ All data is **real** — there is no synthetic/streaming demo path. GH Archive i
 hourly batch product, so an in-container scheduler drives the pipeline. An MQTT broker
 (Mosquitto) is included for real-time health-score alerts — see [MQTT alerts](#mqtt-alerts).
 
-## Two ways to use it
-
-1. **The full platform (recommended)** — a Dockerised medallion lakehouse + serving
-   stack, run with one `docker compose up`. This is the project.
-2. **The standalone ingestion script** — [`GHArchiveDownload.py`](GHArchiveDownload.py)
-   downloads GH Archive and converts it to typed Parquet (the same bronze→silver logic,
-   without the platform). Handy for research/EDA on a laptop.
-
----
-
-## Quickstart (the platform)
-
-Prerequisites: Docker ≥ 24 and Docker Compose ≥ 2.20, ~6–8 GB RAM and ≥ 20 GB free disk.
-
-```bash
-cd Docker
-cp .env.example .env          # defaults work out of the box
-docker compose up --build -d
-```
-
-The stack is six containers: `minio`, `timescaledb`, `redis`, `pipeline`, `api`,
-`dashboard`. The pipeline runs one cycle immediately, then on schedule.
-
-| Interface             | URL                          |
-| --------------------- | ---------------------------- |
-| Dashboard (Streamlit) | `http://localhost:8501`      |
-| API docs (FastAPI)    | `http://localhost:8080/docs` |
-| MinIO console         | `http://localhost:9001`      |
-| RedisInsight          | `http://localhost:8001`      |
-
-> GH Archive publishes each hour on a ~1–2 h delay, so the first live cycle is a
-> couple of hours old. To populate history immediately, run a [backfill](#backfilling-history).
-
-**Deeper docs:** [`Docker/Docker.md`](Docker/Docker.md) (container/ops reference),
-[`Docker/MEDALLION.md`](Docker/MEDALLION.md) (architecture + reasoning),
-[`Docker/services/pipeline/README.md`](Docker/services/pipeline/README.md) (pipeline internals).
-
 ---
 
 ## Architecture in brief
@@ -60,11 +23,141 @@ The stack is six containers: `minio`, `timescaledb`, `redis`, `pipeline`, `api`,
 
 The `pipeline` container orchestrates everything on an in-process scheduler (UTC):
 
-| When                  | Job              | What it does                                                            |
-| --------------------- | ---------------- | ---------------------------------------------------------------------- |
-| Hourly at `:15`       | `hourly_job`     | latest GH Archive hour → bronze → silver → gold (metrics + ML risk)    |
-| Daily at `04:45`      | `retention_job`  | prune aged bronze/silver in MinIO so 24/7 operation doesn't fill disk  |
-| On startup (optional) | `backfill`       | replay a fixed historical hour range, or a year-shifted replay         |
+| When                  | Job             | What it does                                                         |
+| --------------------- | --------------- | -------------------------------------------------------------------- |
+| Hourly at `:15`       | `hourly_job`    | latest GH Archive hour → bronze → silver → gold (metrics + ML risk)  |
+| Daily at `04:45`      | `retention_job` | prune aged bronze/silver in MinIO so 24/7 operation doesn't fill disk |
+| On startup (optional) | `backfill`      | replay a fixed historical hour range, or ingest pre-downloaded Parquet |
+
+**Deeper docs:** [`Docker/Docker.md`](Docker/Docker.md) (container/ops reference),
+[`Docker/MEDALLION.md`](Docker/MEDALLION.md) (architecture + reasoning),
+[`Docker/services/pipeline/README.md`](Docker/services/pipeline/README.md) (pipeline internals).
+
+---
+
+## Getting Started (recommended path)
+
+The stack is **most useful with historical data** — rolling-window metrics (30/90 days)
+are nearly empty on a fresh start and the dashboard looks sparse. The recommended setup
+pre-loads a month (or more) of history using pre-downloaded Parquet files before the
+live pipeline takes over.
+
+**Prerequisites:** Docker ≥ 24 and Docker Compose ≥ 2.20, ~8 GB RAM and ≥ 30 GB free disk.
+
+---
+
+### Step 1 — Download history with `GHArchiveDownload.py`
+
+The standalone script at the repo root downloads GH Archive data month-by-month and
+writes one typed Parquet file per month. These files are what the platform ingests as
+history.
+
+```bash
+# From the repo root
+python3 -m venv .python_env && source .python_env/bin/activate
+pip install duckdb requests
+
+# Edit START_DATE / END_DATE / MAX_WORKERS near the top of the file, then:
+python3 GHArchiveDownload.py
+```
+
+Output lands in `processed_parquet/gh_events_YYYY-MM.parquet` (one file per month).
+Raw `.json.gz` files are cleaned up after each successful conversion.
+
+> **Tip:** each month of GH Archive is roughly 2–4 GB of Parquet. One month is enough
+> to get meaningful metrics. Adjust `MAX_WORKERS` to your bandwidth (default 35).
+
+---
+
+### Step 2 — Configure the stack
+
+```bash
+cd Docker
+cp .env.example .env
+```
+
+Open `.env` and set the backfill source to point at the Parquet files you just
+generated. The simplest option (**Mode A — bind-mount**) requires no upload: Docker
+mounts `../processed_parquet` read-only at `/backfill` inside the pipeline container.
+
+```dotenv
+# Docker/.env  — enable Mode A parquet backfill
+BACKFILL_PARQUET_DIR=/backfill
+```
+
+To also chain a GH Archive hourly download after the Parquet phase (so history is
+contiguous to the present), also set the seam date:
+
+```dotenv
+BACKFILL_PARQUET_DIR=/backfill
+BACKFILL_START=2025-05-01-0    # hourly download picks up here; parquet covers everything before
+```
+
+All other defaults in `.env.example` work out of the box.
+
+> **Alternative — Mode B (upload to MinIO):** if you want the Parquet files stored in
+> MinIO (portable, no bind-mount dependency), see
+> [`Docker/PARQUET_BACKFILL.md`](Docker/PARQUET_BACKFILL.md#mode-b--minio-upload).
+
+---
+
+### Step 3 — Start the stack
+
+```bash
+# From the Docker/ directory
+docker compose down -v          # start clean (important on first run or after config changes)
+docker compose up --build -d
+```
+
+The first build takes 3–5 minutes (base images + Python deps). Then watch the pipeline:
+
+```bash
+docker compose logs -f pipeline
+```
+
+You will see lines like:
+
+```
+parquet-backfill: ingesting gh_events_2025-04.parquet → silver …
+parquet-backfill: ingesting gh_events_2025-05.parquet → silver …
+gold: wrote 3847 repos → TimescaleDB + Redis
+hourly_job: bronze → silver → gold complete
+```
+
+The backfill runs once at startup and is **idempotent** — safe to re-run. The
+live hourly scheduler takes over automatically when it finishes.
+
+---
+
+### Step 4 — Explore the dashboard
+
+| Interface             | URL                          |
+| --------------------- | ---------------------------- |
+| Dashboard (Streamlit) | `http://localhost:8501`      |
+| API docs (FastAPI)    | `http://localhost:8080/docs` |
+| MinIO console         | `http://localhost:9001`      |
+| RedisInsight          | `http://localhost:8001`      |
+
+MinIO console login: `minioadmin` / `minioadmin` (the defaults from `.env.example`).
+
+> **GH Archive lag:** each hourly file is published ~1–2 h after the fact, so the
+> latest live hour is always a couple of hours behind real time. This is normal.
+
+---
+
+## Quick start (cold, no history)
+
+If you just want to try the stack without pre-downloading data, skip Steps 1–2 and
+run directly:
+
+```bash
+cd Docker
+cp .env.example .env
+docker compose up --build -d
+```
+
+The pipeline will start processing the current hour immediately and populate data over
+time. The dashboard will be sparse until enough hourly cycles accumulate.
 
 ---
 
@@ -75,31 +168,11 @@ table lives in [`Docker/Docker.md`](Docker/Docker.md#environment-variables); the
 relevant settings:
 
 - `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` — object-store credentials.
-- `BACKFILL_START` / `BACKFILL_END` — optional one-shot history replay (`YYYY-MM-DD-H`).
+- `BACKFILL_PARQUET_DIR` — set to `/backfill` to activate Mode A Parquet backfill.
+- `BACKFILL_START` / `BACKFILL_END` — optional one-shot GH Archive hour-range replay (`YYYY-MM-DD-H`).
 - `REPLAY_OFFSET_YEARS` — process the feed from N years ago (0 = off; see below).
 - `BRONZE_RETENTION_DAYS` (30) / `SILVER_RETENTION_DAYS` (120) — see [Retention](#retention).
 - `POSTGRES_*`, `REDIS_MAX_MEMORY` — database tuning.
-
-### Backfilling history
-
-To populate metrics with history (rolling windows up to 90 days look empty on a fresh
-start), set a range and bring the stack up:
-
-```dotenv
-# Docker/.env
-BACKFILL_START=2024-01-01-0
-BACKFILL_END=2024-01-31-23
-```
-
-Each stage is idempotent (bronze/silver skip objects already in MinIO), so backfills
-are resumable and safe to re-run.
-
-**Faster: backfill from pre-downloaded Parquet.** Re-downloading months of hourly data
-is slow. If you already have monthly Parquet from the standalone
-[`GHArchiveDownload.py`](GHArchiveDownload.py), set `BACKFILL_PARQUET_DIR=/backfill` (its
-files are bind-mounted there) to ingest them straight into silver — ~6–10× faster, no
-re-download. It takes precedence over `BACKFILL_START/END`; run it on a fresh silver
-bucket. See [`Docker/PARQUET_BACKFILL.md`](Docker/PARQUET_BACKFILL.md).
 
 ### Replaying historical data (`REPLAY_OFFSET_YEARS`)
 
@@ -110,13 +183,12 @@ drives the scheduler, gold's rolling windows, and retention together — the dat
 true dates. Startup runs parquet bulk → hourly tail → live, all year-shifted. This is
 useful because **older GH Archive data carries full PushEvent commit arrays**, so the
 commit-based metrics (bus factor, commit frequency, contributor count) populate — some
-newer/synthetic data omits them.
+newer data omits them.
 
 ### Retention
 
 Gold self-retains (TimescaleDB 2-year policy + Redis LRU/7-day series), but MinIO would
-grow forever under 24/7 ingestion. The daily retention job prunes it with **two
-windows**:
+grow forever under 24/7 ingestion. The daily retention job prunes it with **two windows**:
 
 - **Bronze** is a transient raw landing zone → pruned at `BRONZE_RETENTION_DAYS` (30).
 - **Silver** is the history gold aggregates over rolling windows, so it **must stay
@@ -142,11 +214,11 @@ The retention job above is what makes either viable long-term.
 ## Standalone ingestion script
 
 [`GHArchiveDownload.py`](GHArchiveDownload.py) downloads GH Archive month-by-month and
-writes one typed Parquet per month — useful for offline analysis.
+writes one typed Parquet per month — useful for offline analysis or to pre-populate the
+platform (see [Getting Started](#getting-started-recommended-path)).
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv .python_env && source .python_env/bin/activate
 pip install duckdb requests
 python3 GHArchiveDownload.py     # edit START_DATE / END_DATE near the top first
 ```
@@ -187,9 +259,9 @@ Redis). On all subsequent cycles it reflects the score from the previous gold ru
 
 ### Ports
 
-| Port   | Protocol           |
-| ------ | ------------------ |
-| `1883` | MQTT (TCP)         |
+| Port   | Protocol             |
+| ------ | -------------------- |
+| `1883` | MQTT (TCP)           |
 | `9883` | MQTT over WebSockets |
 
 Both are exposed on `localhost` when the stack is running.
@@ -249,12 +321,12 @@ fake key — no side-effects on the running pipeline.
 ```
 GHArchiveDownload.py     standalone GH Archive → typed monthly Parquet (bronze/silver logic)
 Docker/                  the full Dockerised platform
-  docker-compose.yml     the 6-container stack
+  docker-compose.yml     the 7-container stack
   MEDALLION.md           architecture + design reasoning
   Docker.md              container/operations reference
+  PARQUET_BACKFILL.md    fast history ingestion from pre-downloaded Parquet
   init/timescale/        gold schema (auto-applied on first boot)
   services/pipeline/     the medallion orchestrator (bronze→silver→gold, ML, retention)
   services/api/          FastAPI serving layer
   services/dashboard/    Streamlit dashboard
-ProjectPlan.md           research plan   ·   ProjectDiary.md  development notes
 ```
