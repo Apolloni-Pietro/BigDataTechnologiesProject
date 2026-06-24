@@ -83,7 +83,7 @@ def _replay_startup() -> None:
     scheduler takes over live. BACKFILL_START is optional — if unset, only the
     parquet bulk runs (used by the single-file test).
     """
-    if config.BACKFILL_PARQUET_DIR:
+    if config.BACKFILL_PARQUET_BUCKET or config.BACKFILL_PARQUET_DIR:
         max_date = None
         if config.BACKFILL_START:
             start = _parse_hour(config.BACKFILL_START)
@@ -95,15 +95,36 @@ def _replay_startup() -> None:
              config.REPLAY_OFFSET_YEARS)
 
 
+def _parquet_startup() -> None:
+    """Parquet bulk-ingest (Mode A or B), then optional hourly-download chain.
+
+    If BACKFILL_START is set, caps parquet at day_before(BACKFILL_START) and
+    chains an hourly GH Archive download from BACKFILL_START to now.
+    Without BACKFILL_START: parquet only, no chain (old bind-mount behaviour).
+    """
+    max_date = None
+    if config.BACKFILL_START:
+        start = _parse_hour(config.BACKFILL_START)
+        max_date = (start.date() - timedelta(days=1)).isoformat()
+    pipeline.run_parquet_backfill(max_date=max_date)
+    if config.BACKFILL_START:
+        backfill(_parse_hour(config.BACKFILL_START), pipeline.latest_available_hour())
+
+
 def main() -> None:
     log.info("Pipeline service starting.")
     wait_for_minio()
 
+    if config.BACKFILL_PARQUET_BUCKET and config.BACKFILL_PARQUET_DIR:
+        log.warning(
+            "Both BACKFILL_PARQUET_BUCKET and BACKFILL_PARQUET_DIR are set; "
+            "BACKFILL_PARQUET_BUCKET (Mode B) takes precedence."
+        )
+
     if config.REPLAY_OFFSET_YEARS > 0:
         _replay_startup()
-    # Otherwise: parquet backfill takes precedence over the hour-range backfill.
-    elif config.BACKFILL_PARQUET_DIR:
-        pipeline.run_parquet_backfill()
+    elif config.BACKFILL_PARQUET_BUCKET or config.BACKFILL_PARQUET_DIR:
+        _parquet_startup()   # run_parquet_backfill() picks Mode A or B internally
     elif config.BACKFILL_START and config.BACKFILL_END:
         backfill(_parse_hour(config.BACKFILL_START), _parse_hour(config.BACKFILL_END))
 

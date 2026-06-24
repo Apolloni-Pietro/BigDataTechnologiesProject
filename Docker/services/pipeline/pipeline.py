@@ -58,21 +58,39 @@ def run_retention() -> None:
 def run_parquet_backfill(max_date: str | None = None) -> None:
     """Backfill silver+gold from pre-downloaded monthly Parquet files.
 
-    Re-projects each monthly file (repo-root GHArchiveDownload.py output) straight
-    into silver, then builds gold once. Bronze is intentionally bypassed (the speed
-    win). `max_date` (YYYY-MM-DD) caps ingestion to days <= that date, so in a staged
-    replay the parquet stage doesn't overlap the hourly/live stage that owns the
-    recent days (overlap would double-count in gold). See Docker/PARQUET_BACKFILL.md.
+    Source is determined by config (BACKFILL_PARQUET_BUCKET takes precedence):
+    - BACKFILL_PARQUET_BUCKET: reads from a MinIO bucket via s3:// URIs (Mode B)
+    - BACKFILL_PARQUET_DIR:    reads from a local filesystem path (Mode A)
+
+    DuckDB's httpfs extension (loaded by storage.duckdb_con()) handles both local
+    paths and s3:// URIs transparently in backfill_parquet.build_month(). Bronze is
+    intentionally bypassed. `max_date` (YYYY-MM-DD) caps ingestion to avoid overlap
+    with a subsequent hourly stage. See Docker/PARQUET_BACKFILL.md.
     """
-    pattern = os.path.join(config.BACKFILL_PARQUET_DIR, config.BACKFILL_PARQUET_GLOB)
-    files = sorted(glob.glob(pattern))
-    if not files:
-        log.warning("parquet-backfill: no files match %s — nothing to do", pattern)
+    if config.BACKFILL_PARQUET_BUCKET:
+        import fnmatch as _fnmatch
+        import storage as _storage
+        bucket = config.BACKFILL_PARQUET_BUCKET
+        objects = list(_storage.minio_client().list_objects(bucket, recursive=True))
+        paths = sorted(
+            _storage.s3_uri(bucket, obj.object_name)
+            for obj in objects
+            if _fnmatch.fnmatch(os.path.basename(obj.object_name),
+                                config.BACKFILL_PARQUET_GLOB)
+        )
+        source_desc = f"bucket {bucket}"
+    else:
+        pattern = os.path.join(config.BACKFILL_PARQUET_DIR, config.BACKFILL_PARQUET_GLOB)
+        paths = sorted(glob.glob(pattern))
+        source_desc = pattern
+
+    if not paths:
+        log.warning("parquet-backfill: no files found in %s — nothing to do", source_desc)
         return
 
-    log.info("parquet-backfill: %d monthly file(s) to ingest%s", len(files),
-             f" (up to {max_date})" if max_date else "")
-    for path in files:
+    log.info("parquet-backfill: %d file(s) from %s%s",
+             len(paths), source_desc, f" (up to {max_date})" if max_date else "")
+    for path in paths:
         try:
             backfill_parquet.build_month(path, max_date=max_date)
         except Exception:

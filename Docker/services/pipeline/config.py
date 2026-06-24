@@ -46,14 +46,24 @@ REPLAY_OFFSET_YEARS = int(os.getenv("REPLAY_OFFSET_YEARS", "0"))
 BACKFILL_START = os.getenv("BACKFILL_START", "")
 BACKFILL_END   = os.getenv("BACKFILL_END", "")
 
-# Optional parquet backfill: ingest pre-downloaded monthly Parquet files
-# (produced by the repo-root GHArchiveDownload.py) instead of re-downloading from
-# GH Archive. When BACKFILL_PARQUET_DIR is set the service re-projects each
-# monthly file straight into silver, runs gold once, then continues with the
-# normal schedule. Takes PRECEDENCE over BACKFILL_START/END. Run on a fresh
-# silver bucket. See Docker/PARQUET_BACKFILL.md.
-BACKFILL_PARQUET_DIR  = os.getenv("BACKFILL_PARQUET_DIR", "")          # container path, e.g. /backfill
-BACKFILL_PARQUET_GLOB = os.getenv("BACKFILL_PARQUET_GLOB", "gh_events_*.parquet")
+# Optional parquet backfill. Two mutually exclusive source modes:
+#
+#   Mode A — Bind-mount (BACKFILL_PARQUET_DIR):
+#     Container path to a directory of monthly .parquet files mounted from the host.
+#     e.g. /backfill  (the default bind-mount in docker-compose.yml).
+#
+#   Mode B — MinIO-upload (BACKFILL_PARQUET_BUCKET):
+#     Name of a MinIO bucket where the user has already uploaded the files.
+#     The pipeline reads them via s3:// URIs — no bind-mount needed.
+#     BACKFILL_PARQUET_BUCKET takes precedence over BACKFILL_PARQUET_DIR.
+#
+# In both modes: if BACKFILL_START is set, parquet is capped at
+# day_before(BACKFILL_START) and an hourly GH Archive download continues from
+# BACKFILL_START to now. Leave BACKFILL_START empty for parquet-only (old behaviour).
+# See Docker/PARQUET_BACKFILL.md.
+BACKFILL_PARQUET_DIR    = os.getenv("BACKFILL_PARQUET_DIR", "")
+BACKFILL_PARQUET_GLOB   = os.getenv("BACKFILL_PARQUET_GLOB", "gh_events_*.parquet")
+BACKFILL_PARQUET_BUCKET = os.getenv("BACKFILL_PARQUET_BUCKET", "")
 
 # ── DuckDB resource caps (applied to every storage.duckdb_con) ──────────────
 # Heavy stages (the parquet backfill's per-day dedup, and especially gold's

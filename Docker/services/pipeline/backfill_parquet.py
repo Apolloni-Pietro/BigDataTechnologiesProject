@@ -100,11 +100,15 @@ _PROJECTION = """
 """
 
 
-def build_month(local_path: str, max_date: str | None = None) -> int:
+def build_month(parquet_path: str, max_date: str | None = None) -> int:
     """Re-project one monthly Parquet file into silver, day by day.
 
-    The monthly file is read locally; each day's deduped, re-projected rows are
-    written to `silver/events/event_date=YYYY-MM-DD/data.parquet` on MinIO.
+    `parquet_path` can be a local filesystem path or an s3:// URI.
+    DuckDB's httpfs extension (loaded by storage.duckdb_con()) handles both
+    transparently — no branching needed here.
+
+    Each day's deduped, re-projected rows are written to
+    `silver/events/event_date=YYYY-MM-DD/data.parquet` on MinIO.
     `max_date` (YYYY-MM-DD), when given, skips any day after it — used by the staged
     replay so the parquet stage stops where the hourly/live stage takes over.
     Returns total silver rows written for the month.
@@ -120,13 +124,13 @@ def build_month(local_path: str, max_date: str | None = None) -> int:
         r[0] for r in con.execute(
             f"""
             SELECT DISTINCT event_date
-            FROM read_parquet('{local_path}')
+            FROM read_parquet('{parquet_path}')
             WHERE event_type IN {tracked} AND repo_name IS NOT NULL
             ORDER BY 1
             """
         ).fetchall()
     ]
-    log.info("backfill_parquet: %s -> %d day(s) to ingest", local_path, len(days))
+    log.info("backfill_parquet: %s -> %d day(s) to ingest", parquet_path, len(days))
 
     total = 0
     for day in days:
@@ -144,7 +148,7 @@ def build_month(local_path: str, max_date: str | None = None) -> int:
         query = f"""
         COPY (
             SELECT {_PROJECTION}
-            FROM read_parquet('{local_path}')
+            FROM read_parquet('{parquet_path}')
             WHERE event_date = DATE '{day}'
               AND event_type IN {tracked}
               AND repo_name IS NOT NULL
@@ -156,5 +160,5 @@ def build_month(local_path: str, max_date: str | None = None) -> int:
         total += rows
         log.info("backfill_parquet:   %s -> %d rows", day, rows)
 
-    log.info("backfill_parquet: %s -> %d silver rows total", local_path, total)
+    log.info("backfill_parquet: %s -> %d silver rows total", parquet_path, total)
     return total

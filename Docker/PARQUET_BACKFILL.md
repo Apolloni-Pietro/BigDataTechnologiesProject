@@ -9,16 +9,19 @@ from GH Archive — correct but slow and flaky over months.
 `.parquet` files** straight into the silver layer, skipping the download + JSON-parse
 work entirely. Expect roughly **6–10× faster** for a year-scale backfill.
 
+Both modes can optionally chain a GH Archive hourly download after the parquet phase
+using `BACKFILL_START` as the seam — giving you a complete history without redundancy.
+
 ---
 
 ## How it works
 
 ```
-processed_parquet/gh_events_YYYY-MM.parquet   (host, produced by GHArchiveDownload.py)
-        │   bind-mounted read-only into the pipeline container at /backfill
+monthly gh_events_YYYY-MM.parquet  (local or uploaded to MinIO)
+        │
         ▼
-backfill_parquet.build_month()   ── DuckDB: re-project to the EXACT silver schema,
-        │                             partition by event_date
+backfill_parquet.build_month()  ── DuckDB: re-project to the EXACT silver schema,
+        │                                   partition by event_date
         ▼
 SILVER (MinIO)  events/event_date=YYYY-MM-DD/…parquet
         │   normal silver → gold transform
@@ -38,7 +41,7 @@ GOLD (TimescaleDB + Redis)  ──►  API ──► dashboard
   field names/order/types; `event_date` lives only in the partition path, never as a
   stored column). **If you change silver's schema, change `backfill_parquet.py` in lockstep.**
   Note it partitions by **`event_date` only** (not hour): live silver encodes hour in
-  the *filename*, which DuckDB doesn't treat as a hive key, so matching the key set
+  the _filename_, which DuckDB doesn't treat as a hive key, so matching the key set
   (`event_date` alone) avoids a "Hive partition mismatch" error on gold's combined read.
 - After all months are ingested, gold is built **once** over the busiest repos.
 
@@ -64,26 +67,117 @@ downloads to `raw_json/` and deletes each month's raw files after a successful c
 
 ---
 
-## Step 2 — run the backfill
+## Step 2 — choose a source mode
 
-From `Docker/`:
+### Mode A — bind-mount (files stay on your host machine)
+
+The simplest option: Docker mounts `../processed_parquet` read-only at `/backfill`
+inside the pipeline container. No upload step needed.
 
 ```bash
+cd Docker
+
 # Start clean so backfill output is the only silver data (recommended):
 docker compose down -v
 
-# Enable parquet backfill in .env:
+# Enable Mode A in .env:
 echo "BACKFILL_PARQUET_DIR=/backfill" >> .env
+
+# Optional: chain a GH Archive hourly download after the parquet phase.
+# Parquet will stop at 2025-06-22; hourly will cover 2025-06-23 → now.
+# echo "BACKFILL_START=2025-06-23-0" >> .env
 
 docker compose up --build -d
 docker compose logs -f pipeline      # watch "parquet-backfill" + "gold:" lines
 ```
 
-The pipeline bind-mounts `../processed_parquet` → `/backfill` (read-only), ingests every
-`gh_events_*.parquet`, builds gold, then continues with the normal hourly schedule.
-`BACKFILL_PARQUET_DIR` takes **precedence** over `BACKFILL_START`/`BACKFILL_END`.
+The pipeline reads every `gh_events_*.parquet` from the bind-mounted directory,
+builds silver, builds gold once, then continues with the normal hourly schedule.
 
-### Verify
+---
+
+### Mode B — MinIO-upload (files go into object storage first)
+
+Upload the parquet files into a MinIO bucket **before** starting the full pipeline.
+The pipeline reads them over S3 — no bind-mount is needed or used.
+
+```bash
+cd Docker
+
+# Start clean:
+docker compose down -v
+
+# Set Mode B in .env:
+echo "BACKFILL_PARQUET_BUCKET=parquet-backfill" >> .env
+
+# Optional seam: parquet covers up to 2025-06-22; hourly starts here.
+# echo "BACKFILL_START=2025-06-23-0" >> .env
+
+# 1. Start MinIO alone:
+docker compose up -d minio
+
+# 2. Upload parquet files (adjust the host path as needed):
+docker run --rm \
+  --network docker_default \
+  -v /path/to/processed_parquet:/data:ro \
+  minio/mc:latest /bin/sh -c "
+    mc alias set local http://minio:9000 minioadmin minioadmin &&
+    mc mb --ignore-existing local/parquet-backfill &&
+    mc cp /data/*.parquet local/parquet-backfill/
+  "
+
+# 3. Start everything:
+docker compose up --build -d
+docker compose logs -f pipeline
+```
+
+Alternatively, uncomment the `mc-upload` service in `docker-compose.yml` and run:
+```bash
+docker compose up -d minio
+docker compose --profile upload run --rm mc-upload
+docker compose up -d
+```
+
+---
+
+## Choosing between Mode A and Mode B
+
+| | Mode A (bind-mount) | Mode B (MinIO-upload) |
+|---|---|---|
+| **Extra steps** | None — files stay local | Upload to MinIO first |
+| **Bind-mount required** | Yes (`../processed_parquet` must exist) | No |
+| **Files accessible after stack restart** | Only if host dir still present | Yes — in MinIO named volume |
+| **Best for** | Local dev / one-off backfills | Clean environments, shared setups |
+
+---
+
+## The seam: chaining parquet + hourly download
+
+Set `BACKFILL_START` alongside either mode to split history into two phases:
+
+```
+parquet phase  → covers everything up to day_before(BACKFILL_START)
+hourly phase   → covers BACKFILL_START to latest_available_hour()
+scheduler      → takes over from there
+```
+
+Example for Mode B:
+```dotenv
+BACKFILL_PARQUET_BUCKET=parquet-backfill
+BACKFILL_START=2025-06-23-0
+```
+
+The parquet files will stop at 2025-06-22 (inclusive); the pipeline then downloads
+every hour from 2025-06-23-0 onward before the scheduler takes over. No overlap,
+no gap, no double-counting in gold.
+
+Without `BACKFILL_START`: the parquet phase ingests all available files and the
+scheduler starts immediately (no hourly chain — original behaviour).
+
+---
+
+## Verify
+
 - MinIO console (http://localhost:9001) → `silver/events/event_date=…/…parquet`.
 - Dashboard (http://localhost:8501) → Overview sorted by **Importance** shows big repos
   with sensible (non-null) metrics and multi-day history.
@@ -92,67 +186,16 @@ The pipeline bind-mounts `../processed_parquet` → `/backfill` (read-only), ing
 
 ---
 
-## Configuration
+## Configuration reference
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `BACKFILL_PARQUET_DIR` | _(empty)_ | Container path holding the monthly files. Set to `/backfill` to enable. Empty = disabled. |
-| `BACKFILL_PARQUET_GLOB` | `gh_events_*.parquet` | Filename glob within that directory. |
+| Variable                  | Default               | Meaning |
+| ------------------------- | --------------------- | ------- |
+| `BACKFILL_PARQUET_DIR`    | _(empty)_             | **Mode A**: container path holding the monthly files. Set to `/backfill`. |
+| `BACKFILL_PARQUET_BUCKET` | _(empty)_             | **Mode B**: MinIO bucket name where files were uploaded. Takes precedence over Mode A. |
+| `BACKFILL_PARQUET_GLOB`   | `gh_events_*.parquet` | Filename glob within the source (applied in both modes). |
+| `BACKFILL_START`          | _(empty)_             | Seam hour (`YYYY-MM-DD-H`). When set alongside a parquet mode, caps parquet at `day_before(BACKFILL_START)` and chains an hourly download from here to now. |
+| `BACKFILL_END`            | _(empty)_             | End hour for the hourly-only backfill (no parquet). Unused when a parquet mode is active. |
 
-The bind mount lives in [`docker-compose.yml`](docker-compose.yml) under the `pipeline`
-service (`../processed_parquet:/backfill:ro`). It is harmless when the feature is off.
-
----
-
-## Alternative: pre-upload to MinIO instead of bind-mounting
-
-The bind-mount path above keeps the monthly files on the host. For a more cloud-native
-setup (e.g. running the stack on a remote VM where the files live in object storage,
-or to avoid a host bind mount entirely) you can instead **upload the monthly Parquet to
-MinIO** and have the backfill read them over S3. This is **not implemented** today; the
-following is a complete design so it can be added without re-deriving anything.
-
-**Why it's cheap to add:** `storage.duckdb_con()` is already wired for S3/httpfs against
-MinIO, and `backfill_parquet.build_month()` already takes a single path argument and
-passes it to `read_parquet(...)`. DuckDB's `read_parquet` accepts an `s3://` URI
-transparently, so the projection query needs **no change** — only the source path and
-the file-discovery step change.
-
-**Changes required:**
-
-1. **A new bucket/prefix** for the raw monthly files, e.g. `backfill/gh_events_*.parquet`
-   (either a new bucket `backfill` added to `storage.ensure_buckets()`, or a `backfill/`
-   prefix inside the existing `bronze` bucket). Keep it separate from `silver/events/`.
-
-2. **Upload step (operator action).** Either:
-   - `mc cp processed_parquet/*.parquet myminio/backfill/` with the MinIO client, or
-   - a tiny helper using the existing `storage.minio_client()` /
-     `fput_object` to push each local file. (One-time, run from the host or a job.)
-
-3. **Config:** add `BACKFILL_PARQUET_S3 = os.getenv("BACKFILL_PARQUET_S3", "")` (e.g.
-   `s3://backfill/`) alongside `BACKFILL_PARQUET_DIR`. Decide precedence: if the S3 var
-   is set, use S3 discovery; else fall back to the local-dir discovery.
-
-4. **Discovery over S3** in `pipeline.run_parquet_backfill()`: instead of
-   `glob.glob(local_pattern)`, list objects via
-   `storage.minio_client().list_objects(bucket, prefix="...", recursive=True)`, filter by
-   the `gh_events_*.parquet` suffix, and build `s3://bucket/key` URIs. Sort them. Pass
-   each URI straight to `backfill_parquet.build_month()` — the DuckDB query is unchanged
-   because it already reads whatever path it's handed.
-
-5. **Compose:** drop the `../processed_parquet:/backfill:ro` bind mount; nothing else in
-   the service definition changes (the pipeline already has MinIO credentials/endpoint).
-
-**Trade-offs vs. bind-mount:**
-
-| | Bind-mount (implemented) | MinIO upload (this design) |
-| --- | --- | --- |
-| Setup | Zero — files just sit on the host | Extra one-time upload step |
-| Storage | Single copy on host | Duplicated into MinIO (until deleted) |
-| Remote/cloud hosts | Awkward (need files on the VM's disk) | Natural (object storage is the transport) |
-| Read speed | Local disk (fastest) | Network to MinIO (still fast, same box) |
-| Code touched | none | config + discovery (~30 lines), no query change |
-
-For local/laptop demos the bind-mount is simpler and faster. The MinIO path is worth it
-only when the stack runs somewhere the host filesystem isn't a convenient place for
-multi-GB inputs.
+The bind-mount lives in [`docker-compose.yml`](docker-compose.yml) under the `pipeline`
+service (`../processed_parquet:/backfill:ro`). It is harmless when Mode B is active or
+when no parquet backfill is configured.

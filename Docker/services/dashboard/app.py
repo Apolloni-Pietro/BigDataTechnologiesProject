@@ -7,7 +7,6 @@ import streamlit as st
 import plotly.express as px
 
 # ── Configuration ─────────────────────────────────────────────────────────
-# Questo è l'indirizzo del container dove gira FastAPI!
 API_URL = os.getenv("API_URL", "http://api:8080")
 
 # ── Metric presentation (friendly names + formatting) ─────────────────────

@@ -80,8 +80,8 @@ services:
     image: eclipse-mosquitto:2
     container_name: oss-mqtt
     ports:
-      - "1883:1883"   # MQTT protocol (external clients)
-      - "9883:9883"   # MQTT over WebSockets (browser clients)
+      - "1883:1883" # MQTT protocol (external clients)
+      - "9883:9883" # MQTT over WebSockets (browser clients)
     volumes:
       - ./init/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
     restart: unless-stopped
@@ -118,14 +118,18 @@ services:
       COMMIT_FREQ_WINDOW_DAYS: ${COMMIT_FREQ_WINDOW_DAYS:-30}
       # Filename glob for the parquet backfill (restrict to specific months).
       BACKFILL_PARQUET_GLOB: ${BACKFILL_PARQUET_GLOB:-gh_events_*.parquet}
+      # Mode B parquet backfill: MinIO bucket name where the user uploaded parquet
+      # files with `mc`. Takes precedence over BACKFILL_PARQUET_DIR. See PARQUET_BACKFILL.md.
+      BACKFILL_PARQUET_BUCKET: ${BACKFILL_PARQUET_BUCKET:-}
       # Retention: prune aged MinIO objects so 24/7 operation doesn't fill disk.
       BRONZE_RETENTION_DAYS: ${BRONZE_RETENTION_DAYS:-30}
       SILVER_RETENTION_DAYS: ${SILVER_RETENTION_DAYS:-120}
       RETENTION_CRON_HOUR: ${RETENTION_CRON_HOUR:-4}
       MQTT_ALERT_THRESHOLD: ${MQTT_ALERT_THRESHOLD:-0.4}
     volumes:
-      # Pre-downloaded monthly Parquet files (repo-root GHArchiveDownload.py output)
-      # for the parquet backfill. Read-only; harmless when BACKFILL_PARQUET_DIR is unset.
+      # Mode A (bind-mount) only: pre-downloaded parquet files mounted at /backfill.
+      # Set BACKFILL_PARQUET_DIR=/backfill in .env to activate. Harmless otherwise.
+      # Mode B (MinIO-upload): this mount has no effect; set BACKFILL_PARQUET_BUCKET instead.
       - ../processed_parquet:/backfill:ro
     depends_on:
       minio:
@@ -137,6 +141,38 @@ services:
       mqtt:
         condition: service_started
     restart: unless-stopped
+
+  # ────────────────────────────────────────────────
+  # OPTIONAL: Mode B parquet-upload helper
+  # ────────────────────────────────────────────────
+  # One-shot service to upload local parquet files into MinIO before starting
+  # the full pipeline (Mode B workflow). Activate with the "upload" profile:
+  #
+  #   1. Set BACKFILL_PARQUET_BUCKET=parquet-backfill in .env
+  #   2. docker compose up -d minio
+  #   3. docker compose --profile upload run --rm mc-upload
+  #   4. docker compose up -d
+  #
+  # See PARQUET_BACKFILL.md §Mode B.
+  #
+  mc-upload:
+    image: minio/mc:latest
+    profiles: ["upload"]
+    depends_on:
+      minio:
+        condition: service_started
+    environment:
+      BUCKET: ${BACKFILL_PARQUET_BUCKET:-parquet-backfill}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - ../processed_parquet:/data:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      mc alias set local http://localhost:9000 $$MINIO_ACCESS_KEY $$MINIO_SECRET_KEY &&
+      mc mb --ignore-existing local/$$BUCKET &&
+      mc cp /data/*.parquet local/$$BUCKET/ &&
+      echo "Upload complete."
 
   # ────────────────────────────────────────────────
   # SERVING
